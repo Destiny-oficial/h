@@ -1,0 +1,8 @@
+{
+  "name": "videoteca-netlify",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Catálogo de videos de Mega, YouTube, Drive y más para Netlify",
+  "dependencies": { "@netlify/blobs": "^8.1.0" }
+}
