@@ -8,12 +8,26 @@ const PER_PAGE = 24;
 const TYPES = ['OVA', 'Serie', 'Película', 'Especial'];
 const STATUSES = ['Finalizado', 'En emisión'];
 
+function normalizeEp(e) {
+  if (!Array.isArray(e.servers)) {
+    e.servers = e.embed ? [{ name: e.provider || 'Servidor', kind: e.kind, provider: e.provider, embed: e.embed }] : [];
+    delete e.kind;
+    delete e.provider;
+    delete e.embed;
+  }
+  return e;
+}
+
 /* ---------- almacenamiento (Netlify Blobs) ---------- */
 
 async function load() {
   try {
     const d = await getStore('videoteca').get('series', { type: 'json' });
-    return Array.isArray(d) ? d : [];
+    if (!Array.isArray(d)) return [];
+    d.forEach((s) => {
+      s.episodes = (s.episodes || []).map(normalizeEp);
+    });
+    return d;
   } catch {
     return [];
   }
@@ -187,7 +201,30 @@ function parseSource(raw) {
 
   if (VIDEO_EXT.test(u.pathname)) return { kind: 'video', provider: 'Enlace directo', embed: u.href };
 
-  return { error: 'Servicio no compatible. Usa Mega, YouTube, Google Drive, Vimeo, Dropbox o un enlace directo a un archivo de video.' };
+  if (/^voe[\w.-]*$/.test(host)) {
+    const m = u.pathname.match(/^\/(?:e\/)?([\w-]+)$/);
+    if (m) return { kind: 'frame', provider: 'Voe', embed: `${u.origin}/e/${m[1]}` };
+  }
+
+  const label = host.split('.').slice(-2, -1)[0] || host;
+  return { kind: 'frame', provider: label.charAt(0).toUpperCase() + label.slice(1), embed: u.href };
+}
+
+function parseServers(text) {
+  const servers = [];
+  let thumb = '';
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    const bar = t.indexOf('|');
+    const name = bar > 0 && !/^https?:/i.test(t.slice(0, bar).trim()) ? t.slice(0, bar).trim().slice(0, 30) : '';
+    const link = bar > 0 && name ? t.slice(bar + 1).trim() : t;
+    const src = parseSource(link);
+    if (src.error) return { servers: [], thumb: '', error: `${src.error} (${link.slice(0, 60)})` };
+    servers.push({ name: name || src.provider, kind: src.kind, provider: src.provider, embed: src.embed });
+    if (!thumb && src.thumb) thumb = src.thumb;
+  }
+  return { servers: servers.slice(0, 12), thumb, error: '' };
 }
 
 const cleanUrl = (v) => {
@@ -207,7 +244,7 @@ const MESSAGES = {
   falta: 'Escribe un título.',
   serieok: 'Serie guardada.',
   seriebor: 'Serie eliminada.',
-  epok: 'Episodio agregado.',
+  epok: 'Episodio guardado.',
   epbor: 'Episodio eliminado.',
 };
 
@@ -222,7 +259,7 @@ const tags = (s, n = 15) =>
     .map((g) => `<a class="tag" href="/catalogo?genre=${encodeURIComponent(g)}">${esc(g)}</a>`)
     .join('');
 
-function layout({ title, body, script = false, q = '', bare = false }) {
+function layout({ title, body, script = false, hls = false, q = '', bare = false }) {
   const head = `<!doctype html>
 <html lang="es">
 <head>
@@ -247,7 +284,8 @@ function layout({ title, body, script = false, q = '', bare = false }) {
 ${body}
 </main>
 <footer class="foot"><span>${esc(SITE_NAME)} · Solo para mayores de 18 años</span><a href="/admin">Administrar</a></footer>
-${script ? '<script src="/app.js" defer></script>' : ''}
+${hls ? '<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>' : ''}
+${script || hls ? '<script src="/app.js" defer></script>' : ''}
 </body>
 </html>`;
 }
@@ -400,21 +438,32 @@ ${eps.length ? epList(s, eps, 0) : '<p class="empty">Todavía no hay episodios.<
   });
 }
 
-function episodePage(s, e) {
+function episodePage(s, e, idx) {
   const eps = [...(s.episodes || [])].sort((a, b) => a.n - b.n);
   const prev = [...eps].reverse().find((x) => x.n < e.n);
   const next = eps.find((x) => x.n > e.n);
-  const player =
-    e.kind === 'video'
-      ? `<video controls preload="metadata" playsinline src="${esc(e.embed)}"></video>`
-      : `<iframe src="${esc(e.embed)}" title="${esc(s.title)} episodio ${e.n}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
+  const sv = e.servers[idx];
+  const isHls = sv.kind === 'video' && /\.m3u8(\?|$)/i.test(sv.embed);
+  const player = isHls
+    ? `<video controls playsinline data-hls="${esc(sv.embed)}"></video>`
+    : sv.kind === 'video'
+    ? `<video controls preload="metadata" playsinline src="${esc(sv.embed)}"></video>`
+    : `<iframe src="${esc(sv.embed)}" title="${esc(s.title)} episodio ${e.n}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
+  const base = `/media/${esc(s.slug)}/${e.n}`;
+  const servers =
+    e.servers.length > 1
+      ? `<nav class="servers" aria-label="Servidores"><span>Servidor:</span>${e.servers
+          .map((v, i) => `<a class="srv${i === idx ? ' on' : ''}" href="${base}?s=${i + 1}">${esc(v.name)}</a>`)
+          .join('')}</nav>`
+      : '';
   return layout({
     title: `${s.title} episodio ${e.n} | ${SITE_NAME}`,
+    hls: isHls,
     body: `<a class="back" href="/media/${esc(s.slug)}">${esc(s.title)}</a>
 <div class="player">${player}</div>
+${servers}
 <h1 class="vt">${esc(s.title)} · Episodio ${e.n}</h1>
 ${e.title ? `<p class="meta">${esc(e.title)}</p>` : ''}
-<p class="meta">Desde ${esc(e.provider)}</p>
 <nav class="epnav">${prev ? `<a class="btn ghost" href="/media/${esc(s.slug)}/${prev.n}">Anterior</a>` : ''}${next ? `<a class="btn" href="/media/${esc(s.slug)}/${next.n}">Siguiente</a>` : ''}</nav>
 <h2>Episodios</h2>
 ${epList(s, eps, e.n)}`,
@@ -494,9 +543,14 @@ function adminSeriePage(req, s, note, bad) {
   const eps = [...(s.episodes || [])].sort((a, b) => a.n - b.n);
   const rows = eps
     .map(
-      (e) => `<li>
-  <div><strong>Episodio ${e.n}${e.title ? ' · ' + esc(e.title) : ''}</strong><span>${esc(e.provider)}</span></div>
-  <form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/borrar"><button class="btn ghost" type="submit">Eliminar</button></form>
+      (e) => `<li class="col">
+  <strong>Episodio ${e.n}${e.title ? ' · ' + esc(e.title) : ''}</strong>
+  <div class="srvs">${e.servers
+    .map(
+      (v, i) => `<form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/servidor/${i}/borrar"><button class="btn ghost" type="submit" title="Quitar este servidor">${esc(v.name)} ✕</button></form>`
+    )
+    .join('')}</div>
+  <form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/borrar"><button class="btn ghost" type="submit">Eliminar episodio</button></form>
 </li>`
     )
     .join('');
@@ -508,16 +562,17 @@ function adminSeriePage(req, s, note, bad) {
 ${noteHtml(note, bad)}
 <h2>Episodios (${eps.length})</h2>
 <ul class="rows">${rows || '<li><span>No hay episodios todavía.</span></li>'}</ul>
-<h2>Agregar episodio</h2>
+<h2>Agregar episodio o servidores</h2>
 <form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio">
-  <label>Número<input name="n" inputmode="numeric" maxlength="4" placeholder="Vacío = el siguiente"></label>
+  <label>Número<input name="n" inputmode="numeric" maxlength="4" placeholder="Vacío = el siguiente">
+    <small>Si el número ya existe, los enlaces se suman como servidores de ese episodio.</small></label>
   <label>Título del episodio (opcional)<input name="title" maxlength="120"></label>
-  <label>Enlace del video
-    <input name="url" type="url" required placeholder="https://mega.nz/file/...">
-    <small>Mega, YouTube, Google Drive, Vimeo, Dropbox o enlace directo a un archivo de video.</small>
+  <label>Enlaces del video, uno por línea
+    <textarea name="urls" rows="5" required placeholder="https://mega.nz/file/...&#10;https://voe.sx/...&#10;Mi servidor | https://..."></textarea>
+    <small>Mega, YouTube, Drive, Vimeo, Dropbox, .mp4 y .m3u8 se reconocen solos. Para Voe, Upload, Streamtape y similares usa el enlace de insertar (embed). Para poner un nombre propio: Nombre | enlace.</small>
   </label>
   <label>Imagen del episodio (opcional)<input name="thumb" type="url" placeholder="https://..."></label>
-  <button class="btn" type="submit">Agregar episodio</button>
+  <button class="btn" type="submit">Guardar</button>
 </form>
 <h2>Datos de la serie</h2>
 <form class="form" method="post" action="/admin/serie/guardar">
@@ -628,6 +683,12 @@ small{color:var(--muted);font-weight:400}
 .rows li{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}
 .rows span{display:block;color:var(--muted);font-size:.9rem}
 .out{margin-top:32px}
+.servers{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:14px;color:var(--muted)}
+.srv{border:1px solid var(--line);border-radius:8px;padding:6px 14px;text-decoration:none;color:var(--text);background:var(--surface)}
+.srv:hover{border-color:var(--accent)}
+.srv.on{background:var(--accent);border-color:var(--accent);color:#2a1d05;font-weight:600}
+.rows li.col{flex-direction:column;align-items:flex-start;gap:8px}
+.srvs{display:flex;flex-wrap:wrap;gap:6px}
 .gate{max-width:460px;margin:0 auto;padding:18vh 24px 40px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:18px}
 .gate p{color:var(--muted);margin:0}
 .gate .leave{color:var(--muted);font-size:.9rem}
@@ -636,6 +697,18 @@ small{color:var(--muted);font-weight:400}
 `;
 
 const CLIENT_JS = `
+(function () {
+  var v = document.querySelector('video[data-hls]');
+  if (!v) return;
+  var src = v.getAttribute('data-hls');
+  if (window.Hls && window.Hls.isSupported()) {
+    var h = new window.Hls();
+    h.loadSource(src);
+    h.attachMedia(v);
+  } else {
+    v.src = src;
+  }
+})();
 (function () {
   var sl = document.getElementById('slides');
   if (!sl) return;
@@ -678,11 +751,13 @@ const CLIENT_JS = `
 const SECURITY = {
   'Content-Security-Policy': [
     "default-src 'self'",
-    "script-src 'self'",
+    "script-src 'self' https://cdn.jsdelivr.net",
     "style-src 'self' https://fonts.googleapis.com",
     'font-src https://fonts.gstatic.com',
     'img-src * data:',
-    'media-src *',
+    'media-src * blob:',
+    'connect-src *',
+    'worker-src blob:',
     'frame-src https://mega.nz https://www.youtube-nocookie.com https://drive.google.com https://player.vimeo.com',
     "form-action 'self'",
     "base-uri 'none'",
@@ -693,7 +768,7 @@ const SECURITY = {
 
 const send = (body, type, status = 200, extra = {}) =>
   new Response(body, { status, headers: { 'Content-Type': type, ...SECURITY, ...extra } });
-const page = (html, status = 200) => send(html, 'text/html; charset=utf-8', status);
+const page = (html, status = 200, extra = {}) => send(html, 'text/html; charset=utf-8', status, extra);
 const go = (req, to, extra = {}) =>
   new Response(null, { status: 303, headers: { Location: new URL(to, req.url).href, ...extra } });
 const notFound = (msg) =>
@@ -811,23 +886,43 @@ export default async (req, context) => {
     if (add) {
       const s = list.find((x) => x.id === add[1]);
       if (!s) return notFound('Serie no encontrada');
-      const src = parseSource(String(form.get('url') || ''));
-      if (src.error) return page(adminSeriePage(req, s, src.error, true));
+      const parsed = parseServers(form.get('urls') || form.get('url') || '');
+      if (parsed.error) return page(adminSeriePage(req, s, parsed.error, true));
+      if (!parsed.servers.length) return page(adminSeriePage(req, s, 'Pega al menos un enlace de video.', true));
       let n = parseInt(form.get('n'), 10);
       if (!(n >= 1 && n <= 9999)) n = Math.max(0, ...s.episodes.map((e) => e.n)) + 1;
-      if (s.episodes.some((e) => e.n === n)) return page(adminSeriePage(req, s, 'Ese número de episodio ya existe.', true));
-      s.episodes.push({
-        n,
-        title: String(form.get('title') || '').trim().slice(0, 120),
-        kind: src.kind,
-        provider: src.provider,
-        embed: src.embed,
-        thumb: cleanUrl(form.get('thumb')) || src.thumb || '',
-        createdAt: new Date().toISOString(),
-      });
-      s.episodes.sort((a, b) => a.n - b.n);
+      const thumb = cleanUrl(form.get('thumb')) || parsed.thumb || '';
+      const ex = s.episodes.find((e) => e.n === n);
+      if (ex) {
+        ex.servers = [...ex.servers, ...parsed.servers].slice(0, 12);
+        if (!ex.thumb && thumb) ex.thumb = thumb;
+        const t = String(form.get('title') || '').trim().slice(0, 120);
+        if (t) ex.title = t;
+      } else {
+        s.episodes.push({
+          n,
+          title: String(form.get('title') || '').trim().slice(0, 120),
+          thumb,
+          servers: parsed.servers,
+          createdAt: new Date().toISOString(),
+        });
+        s.episodes.sort((a, b) => a.n - b.n);
+      }
       await save(list);
       return go(req, `/admin/serie/${s.id}?m=epok`);
+    }
+
+    const delSrv = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/servidor\/(\d+)\/borrar$/);
+    if (delSrv) {
+      const s = list.find((x) => x.id === delSrv[1]);
+      if (!s) return notFound('Serie no encontrada');
+      const e = s.episodes.find((x) => x.n === Number(delSrv[2]));
+      if (e) {
+        e.servers = e.servers.filter((_, i) => i !== Number(delSrv[3]));
+        if (!e.servers.length) s.episodes = s.episodes.filter((x) => x !== e);
+        await save(list);
+      }
+      return go(req, `/admin/serie/${s.id}?m=epbor`);
     }
 
     const delEp = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/borrar$/);
@@ -857,7 +952,12 @@ export default async (req, context) => {
     if (!s) return notFound('No encontrado');
     if (!m[2]) return page(seriePage(s));
     const e = (s.episodes || []).find((x) => x.n === Number(m[2]));
-    return e ? page(episodePage(s, e)) : notFound('Episodio no encontrado');
+    if (!e || !e.servers.length) return notFound('Episodio no encontrado');
+    const idx = Math.min(Math.max(parseInt(url.searchParams.get('s'), 10) || 1, 1), e.servers.length) - 1;
+    const sv = e.servers[idx];
+    const csp = SECURITY['Content-Security-Policy'];
+    const extra = sv.kind === 'frame' ? { 'Content-Security-Policy': csp.replace('frame-src ', `frame-src ${new URL(sv.embed).origin} `) } : {};
+    return page(episodePage(s, e, idx), 200, extra);
   }
 
   return notFound('Página no encontrada');
