@@ -4,9 +4,33 @@ import { getStore } from '@netlify/blobs';
 const SITE_NAME = process.env.SITE_NAME || 'Videoteca';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD;
+const IMGBB_KEY = process.env.IMGBB_KEY || '';
 const PER_PAGE = 24;
 const TYPES = ['OVA', 'Serie', 'Película', 'Especial'];
 const STATUSES = ['Finalizado', 'En emisión'];
+
+async function uploadImage(file) {
+  if (!file || typeof file === 'string' || !file.size) return '';
+  if (!IMGBB_KEY) throw new Error('Falta la variable IMGBB_KEY en Netlify para subir imágenes.');
+  if (!String(file.type).startsWith('image/')) throw new Error('El archivo no es una imagen.');
+  if (file.size > 5 * 1024 * 1024) throw new Error('La imagen pesa más de 5 MB.');
+  const body = new FormData();
+  body.append('image', file, file.name || 'imagen.jpg');
+  let j = null;
+  let ok = false;
+  try {
+    const res = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(IMGBB_KEY), { method: 'POST', body });
+    ok = res.ok;
+    j = await res.json();
+  } catch {
+    throw new Error('No se pudo conectar con ImgBB. Intenta de nuevo.');
+  }
+  if (!ok || !j || !j.success || !j.data || !j.data.url) {
+    const why = j && j.error && j.error.message ? `: ${j.error.message}` : '';
+    throw new Error(`ImgBB no aceptó la imagen${why}`);
+  }
+  return j.data.url;
+}
 
 function normalizeEp(e) {
   if (!Array.isArray(e.servers)) {
@@ -473,7 +497,7 @@ ${epList(s, eps, e.n)}`,
 /* ---------- panel ---------- */
 
 function adminShell(title, inner) {
-  return layout({ title: `${title} | ${SITE_NAME}`, body: inner });
+  return layout({ title: `${title} | ${SITE_NAME}`, body: inner, script: true });
 }
 
 const noteHtml = (note, bad) => (note ? `<p class="note ${bad ? 'bad' : ''}">${esc(note)}</p>` : '');
@@ -504,11 +528,15 @@ function serieFields(s = {}) {
 </div>
 <label>Géneros (separados por coma)<input name="genres" value="${esc((s.genres || []).join(', '))}"></label>
 <label>Sinopsis<textarea name="synopsis" rows="4" maxlength="1500">${v('synopsis')}</textarea></label>
-<label>Portada (enlace de imagen vertical)
-  <input name="cover" type="url" value="${v('cover')}" placeholder="https://...">
-  <small>Puedes subir la imagen a ImgBB y pegar el enlace directo.</small>
+<label>Portada (imagen vertical)
+  <input type="file" name="coverfile" accept="image/*" data-resize>
+  <small>Elige una foto y se sube sola. También puedes pegar un enlace.</small>
+  <input name="cover" type="url" value="${v('cover')}" placeholder="o pega un enlace https://...">
 </label>
-<label>Imagen ancha para el carrusel (opcional)<input name="backdrop" type="url" value="${v('backdrop')}" placeholder="https://..."></label>
+<label>Imagen ancha para el carrusel (opcional)
+  <input type="file" name="backdropfile" accept="image/*" data-resize>
+  <input name="backdrop" type="url" value="${v('backdrop')}" placeholder="o pega un enlace https://...">
+</label>
 <label class="check"><input type="checkbox" name="featured" value="1"${s.featured ? ' checked' : ''}> Mostrar en el carrusel de la portada</label>`;
 }
 
@@ -528,7 +556,7 @@ function adminPage(req, list, note, bad) {
     `<h1>Panel</h1>
 ${noteHtml(note, bad)}
 <h2>Nueva serie</h2>
-<form class="form" method="post" action="/admin/serie/guardar">
+<form class="form" method="post" action="/admin/serie/guardar" enctype="multipart/form-data">
   ${serieFields()}
   <button class="btn" type="submit">Crear serie</button>
 </form>
@@ -563,7 +591,7 @@ ${noteHtml(note, bad)}
 <h2>Episodios (${eps.length})</h2>
 <ul class="rows">${rows || '<li><span>No hay episodios todavía.</span></li>'}</ul>
 <h2>Agregar episodio o servidores</h2>
-<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio">
+<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio" enctype="multipart/form-data">
   <label>Número<input name="n" inputmode="numeric" maxlength="4" placeholder="Vacío = el siguiente">
     <small>Si el número ya existe, los enlaces se suman como servidores de ese episodio.</small></label>
   <label>Título del episodio (opcional)<input name="title" maxlength="120"></label>
@@ -571,11 +599,14 @@ ${noteHtml(note, bad)}
     <textarea name="urls" rows="5" required placeholder="https://mega.nz/file/...&#10;https://voe.sx/...&#10;Mi servidor | https://..."></textarea>
     <small>Mega, YouTube, Drive, Vimeo, Dropbox, .mp4 y .m3u8 se reconocen solos. Para Voe, Upload, Streamtape y similares usa el enlace de insertar (embed). Para poner un nombre propio: Nombre | enlace.</small>
   </label>
-  <label>Imagen del episodio (opcional)<input name="thumb" type="url" placeholder="https://..."></label>
+  <label>Imagen del episodio (opcional)
+    <input type="file" name="thumbfile" accept="image/*" data-resize>
+    <input name="thumb" type="url" placeholder="o pega un enlace https://...">
+  </label>
   <button class="btn" type="submit">Guardar</button>
 </form>
 <h2>Datos de la serie</h2>
-<form class="form" method="post" action="/admin/serie/guardar">
+<form class="form" method="post" action="/admin/serie/guardar" enctype="multipart/form-data">
   ${serieFields(s)}
   <button class="btn" type="submit">Guardar cambios</button>
 </form>
@@ -591,14 +622,17 @@ function adminEpisodePage(req, s, e, note, bad) {
     `<a class="back" href="/admin/serie/${esc(s.id)}">Volver a ${esc(s.title)}</a>
 <h1>Editar episodio ${e.n}</h1>
 ${noteHtml(note, bad)}
-<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/guardar">
+<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/guardar" enctype="multipart/form-data">
   <label>Número<input name="n" inputmode="numeric" maxlength="4" required value="${e.n}"></label>
   <label>Título del episodio (opcional)<input name="title" maxlength="120" value="${esc(e.title || '')}"></label>
   <label>Servidores, uno por línea
     <textarea name="urls" rows="7" required>${esc(lines)}</textarea>
     <small>Formato: Nombre | enlace. Puedes cambiar el nombre, el enlace, el orden, quitar líneas o agregar nuevas. El primero es el que se abre por defecto.</small>
   </label>
-  <label>Imagen del episodio (opcional)<input name="thumb" type="url" value="${esc(e.thumb || '')}" placeholder="https://..."></label>
+  <label>Imagen del episodio (opcional)
+    <input type="file" name="thumbfile" accept="image/*" data-resize>
+    <input name="thumb" type="url" value="${esc(e.thumb || '')}" placeholder="o pega un enlace https://...">
+  </label>
   <button class="btn" type="submit">Guardar cambios</button>
 </form>`
   );
@@ -719,6 +753,29 @@ small{color:var(--muted);font-weight:400}
 
 const CLIENT_JS = `
 (function () {
+  var inputs = document.querySelectorAll('input[type=file][data-resize]');
+  Array.prototype.forEach.call(inputs, function (input) {
+    input.addEventListener('change', function () {
+      var f = input.files && input.files[0];
+      if (!f || f.type.indexOf('image/') !== 0 || f.size < 1500000 || !window.createImageBitmap) return;
+      createImageBitmap(f).then(function (bmp) {
+        var k = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+        var c = document.createElement('canvas');
+        c.width = Math.round(bmp.width * k);
+        c.height = Math.round(bmp.height * k);
+        c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+        c.toBlob(function (b) {
+          if (!b) return;
+          var nf = new File([b], 'imagen.jpg', { type: 'image/jpeg' });
+          var dt = new DataTransfer();
+          dt.items.add(nf);
+          input.files = dt.files;
+        }, 'image/jpeg', 0.88);
+      });
+    });
+  });
+})();
+(function () {
   var v = document.querySelector('video[data-hls]');
   if (!v) return;
   var src = v.getAttribute('data-hls');
@@ -812,12 +869,23 @@ export default async (req, context) => {
   }
 
   let form = null;
+  let fd = null;
   if (req.method === 'POST') {
     const origin = req.headers.get('origin');
     if (origin && new URL(origin).host !== url.host) return send('Solicitud rechazada', 'text/plain', 403);
-    const raw = await req.text();
-    if (raw.length > 30000) return send('Solicitud demasiado grande', 'text/plain', 413);
-    form = new URLSearchParams(raw);
+    if ((req.headers.get('content-type') || '').startsWith('multipart/form-data')) {
+      if (Number(req.headers.get('content-length') || 0) > 5.5 * 1024 * 1024) return send('La imagen es demasiado grande (máximo 5 MB).', 'text/plain', 413);
+      try {
+        fd = await req.formData();
+      } catch {
+        return send('Solicitud no válida', 'text/plain', 400);
+      }
+      form = { get: (k) => (typeof fd.get(k) === 'string' ? fd.get(k) : null) };
+    } else {
+      const raw = await req.text();
+      if (raw.length > 30000) return send('Solicitud demasiado grande', 'text/plain', 413);
+      form = new URLSearchParams(raw);
+    }
   } else if (!isGet) {
     return send('Método no permitido', 'text/plain', 405);
   }
@@ -875,6 +943,15 @@ export default async (req, context) => {
     if (p === '/admin/serie/guardar') {
       const title = String(form.get('title') || '').trim().slice(0, 140);
       if (!title) return go(req, '/admin?m=falta');
+      let coverUp = '';
+      let backUp = '';
+      try {
+        coverUp = await uploadImage(fd && fd.get('coverfile'));
+        backUp = await uploadImage(fd && fd.get('backdropfile'));
+      } catch (err) {
+        const cur = form.get('id') ? list.find((x) => x.id === form.get('id')) : null;
+        return page(cur ? adminSeriePage(req, cur, err.message, true) : adminPage(req, list, err.message, true));
+      }
       const year = String(form.get('year') || '').trim();
       const data = {
         title,
@@ -883,8 +960,8 @@ export default async (req, context) => {
         year: /^\d{4}$/.test(year) ? year : '',
         genres: parseGenres(form.get('genres')),
         synopsis: String(form.get('synopsis') || '').trim().slice(0, 1500),
-        cover: cleanUrl(form.get('cover')),
-        backdrop: cleanUrl(form.get('backdrop')),
+        cover: coverUp || cleanUrl(form.get('cover')),
+        backdrop: backUp || cleanUrl(form.get('backdrop')),
         featured: form.get('featured') === '1',
       };
       let s = form.get('id') ? list.find((x) => x.id === form.get('id')) : null;
@@ -919,7 +996,13 @@ export default async (req, context) => {
       if (!parsed.servers.length) return page(adminSeriePage(req, s, 'Pega al menos un enlace de video.', true));
       let n = parseInt(form.get('n'), 10);
       if (!(n >= 1 && n <= 9999)) n = Math.max(0, ...s.episodes.map((e) => e.n)) + 1;
-      const thumb = cleanUrl(form.get('thumb')) || parsed.thumb || '';
+      let up = '';
+      try {
+        up = await uploadImage(fd && fd.get('thumbfile'));
+      } catch (err) {
+        return page(adminSeriePage(req, s, err.message, true));
+      }
+      const thumb = up || cleanUrl(form.get('thumb')) || parsed.thumb || '';
       const ex = s.episodes.find((e) => e.n === n);
       if (ex) {
         ex.servers = [...ex.servers, ...parsed.servers].slice(0, 12);
@@ -951,9 +1034,15 @@ export default async (req, context) => {
       const n = parseInt(form.get('n'), 10);
       if (!(n >= 1 && n <= 9999)) return page(adminEpisodePage(req, s, e, 'El número no es válido.', true));
       if (n !== e.n && s.episodes.some((x) => x.n === n)) return page(adminEpisodePage(req, s, e, 'Ya existe otro episodio con ese número.', true));
+      let up = '';
+      try {
+        up = await uploadImage(fd && fd.get('thumbfile'));
+      } catch (err) {
+        return page(adminEpisodePage(req, s, e, err.message, true));
+      }
       e.n = n;
       e.title = String(form.get('title') || '').trim().slice(0, 120);
-      e.thumb = cleanUrl(form.get('thumb')) || parsed.thumb || '';
+      e.thumb = up || cleanUrl(form.get('thumb')) || parsed.thumb || '';
       e.servers = parsed.servers;
       s.episodes.sort((a, b) => a.n - b.n);
       await save(list);
