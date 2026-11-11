@@ -152,7 +152,7 @@ function parseSource(raw) {
     return { error: 'El enlace de Mega está incompleto. Copia el enlace completo, con la clave después del #.' };
   }
 
-  if (host === 'youtu.be' || host.endsWith('youtube.com')) {
+  if (host === 'youtu.be' || host.endsWith('youtube.com') || host === 'youtube-nocookie.com') {
     let id = '';
     if (host === 'youtu.be') id = u.pathname.slice(1).split('/')[0];
     else if (u.pathname === '/watch') id = u.searchParams.get('v') || '';
@@ -191,7 +191,7 @@ function parseSource(raw) {
     return { error: 'No se pudo leer el enlace de Vimeo.' };
   }
 
-  if (host.endsWith('dropbox.com')) {
+  if (host.endsWith('dropbox.com') || host.endsWith('dropboxusercontent.com')) {
     const d = new URL(u.href);
     d.hostname = 'dl.dropboxusercontent.com';
     d.searchParams.delete('dl');
@@ -550,7 +550,7 @@ function adminSeriePage(req, s, note, bad) {
       (v, i) => `<form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/servidor/${i}/borrar"><button class="btn ghost" type="submit" title="Quitar este servidor">${esc(v.name)} ✕</button></form>`
     )
     .join('')}</div>
-  <form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/borrar"><button class="btn ghost" type="submit">Eliminar episodio</button></form>
+  <div class="srvs"><a class="btn ghost" href="/admin/serie/${esc(s.id)}/episodio/${e.n}/editar">Editar episodio</a><form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/borrar"><button class="btn ghost" type="submit">Eliminar episodio</button></form></div>
 </li>`
     )
     .join('');
@@ -580,6 +580,27 @@ ${noteHtml(note, bad)}
   <button class="btn" type="submit">Guardar cambios</button>
 </form>
 <form method="post" action="/admin/serie/${esc(s.id)}/borrar" class="out"><button class="btn ghost" type="submit">Eliminar serie completa</button></form>`
+  );
+}
+
+function adminEpisodePage(req, s, e, note, bad) {
+  if (!isAdmin(req)) return loginPage(note, bad);
+  const lines = e.servers.map((v) => `${v.name} | ${v.embed}`).join('\n');
+  return adminShell(
+    `${s.title} episodio ${e.n}`,
+    `<a class="back" href="/admin/serie/${esc(s.id)}">Volver a ${esc(s.title)}</a>
+<h1>Editar episodio ${e.n}</h1>
+${noteHtml(note, bad)}
+<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/guardar">
+  <label>Número<input name="n" inputmode="numeric" maxlength="4" required value="${e.n}"></label>
+  <label>Título del episodio (opcional)<input name="title" maxlength="120" value="${esc(e.title || '')}"></label>
+  <label>Servidores, uno por línea
+    <textarea name="urls" rows="7" required>${esc(lines)}</textarea>
+    <small>Formato: Nombre | enlace. Puedes cambiar el nombre, el enlace, el orden, quitar líneas o agregar nuevas. El primero es el que se abre por defecto.</small>
+  </label>
+  <label>Imagen del episodio (opcional)<input name="thumb" type="url" value="${esc(e.thumb || '')}" placeholder="https://..."></label>
+  <button class="btn" type="submit">Guardar cambios</button>
+</form>`
   );
 }
 
@@ -633,13 +654,13 @@ input::placeholder,textarea::placeholder{color:#7d74a0}
 .sh h2{margin:40px 0 16px}
 .sh a{color:var(--muted);text-decoration:none;font-size:.95rem}
 .sh a:hover{color:var(--accent)}
-.eps{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:22px 18px}
+.eps{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:20px 14px}
 .ep{display:block;text-decoration:none}
 .eimg,.pimg,.scover{position:relative;overflow:hidden;background:var(--surface);border:1px solid var(--line);border-radius:10px}
 .eimg{aspect-ratio:16/9}
 .eimg img,.pimg img,.scover img{width:100%;height:100%;object-fit:cover;display:block}
-.ep strong{display:block;margin-top:8px}
-.ep span{display:block;color:var(--muted);font-size:.9rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ep strong{display:block;margin-top:6px;font-size:.95rem}
+.ep span{display:block;color:var(--muted);font-size:.85rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .posters{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:22px 16px}
 .poster{display:block;text-decoration:none}
 .pimg{aspect-ratio:2/3}
@@ -692,7 +713,7 @@ small{color:var(--muted);font-weight:400}
 .gate{max-width:460px;margin:0 auto;padding:18vh 24px 40px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:18px}
 .gate p{color:var(--muted);margin:0}
 .gate .leave{color:var(--muted);font-size:.9rem}
-@media (max-width:640px){.sheet{grid-template-columns:1fr}.scover{max-width:200px}.sbox{flex-basis:100%;margin-left:0}.nav{margin-left:auto}}
+@media (max-width:640px){.eps{grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:18px 12px}.sheet{grid-template-columns:1fr}.scover{max-width:200px}.sbox{flex-basis:100%;margin-left:0}.nav{margin-left:auto}}
 @media (prefers-reduced-motion:no-preference){.eimg,.pimg{transition:border-color .15s}}
 `;
 
@@ -758,7 +779,7 @@ const SECURITY = {
     'media-src * blob:',
     'connect-src *',
     'worker-src blob:',
-    'frame-src https://mega.nz https://www.youtube-nocookie.com https://drive.google.com https://player.vimeo.com',
+    'frame-src https:',
     "form-action 'self'",
     "base-uri 'none'",
   ].join('; '),
@@ -824,6 +845,13 @@ export default async (req, context) => {
         if (!s) return notFound('Serie no encontrada');
         const k = url.searchParams.get('m');
         return page(adminSeriePage(req, s, MESSAGES[k] || '', isBadMsg(k)));
+      }
+      const me = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/editar$/);
+      if (me) {
+        const s = list.find((x) => x.id === me[1]);
+        const e = s && s.episodes.find((x) => x.n === Number(me[2]));
+        if (!e) return notFound('Episodio no encontrado');
+        return page(adminEpisodePage(req, s, e, '', false));
       }
       return notFound('Página no encontrada');
     }
@@ -912,6 +940,26 @@ export default async (req, context) => {
       return go(req, `/admin/serie/${s.id}?m=epok`);
     }
 
+    const saveEp = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/guardar$/);
+    if (saveEp) {
+      const s = list.find((x) => x.id === saveEp[1]);
+      const e = s && s.episodes.find((x) => x.n === Number(saveEp[2]));
+      if (!e) return notFound('Episodio no encontrado');
+      const parsed = parseServers(form.get('urls'));
+      if (parsed.error) return page(adminEpisodePage(req, s, e, parsed.error, true));
+      if (!parsed.servers.length) return page(adminEpisodePage(req, s, e, 'Deja al menos un servidor.', true));
+      const n = parseInt(form.get('n'), 10);
+      if (!(n >= 1 && n <= 9999)) return page(adminEpisodePage(req, s, e, 'El número no es válido.', true));
+      if (n !== e.n && s.episodes.some((x) => x.n === n)) return page(adminEpisodePage(req, s, e, 'Ya existe otro episodio con ese número.', true));
+      e.n = n;
+      e.title = String(form.get('title') || '').trim().slice(0, 120);
+      e.thumb = cleanUrl(form.get('thumb')) || parsed.thumb || '';
+      e.servers = parsed.servers;
+      s.episodes.sort((a, b) => a.n - b.n);
+      await save(list);
+      return go(req, `/admin/serie/${s.id}?m=epok`);
+    }
+
     const delSrv = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/servidor\/(\d+)\/borrar$/);
     if (delSrv) {
       const s = list.find((x) => x.id === delSrv[1]);
@@ -954,10 +1002,7 @@ export default async (req, context) => {
     const e = (s.episodes || []).find((x) => x.n === Number(m[2]));
     if (!e || !e.servers.length) return notFound('Episodio no encontrado');
     const idx = Math.min(Math.max(parseInt(url.searchParams.get('s'), 10) || 1, 1), e.servers.length) - 1;
-    const sv = e.servers[idx];
-    const csp = SECURITY['Content-Security-Policy'];
-    const extra = sv.kind === 'frame' ? { 'Content-Security-Policy': csp.replace('frame-src ', `frame-src ${new URL(sv.embed).origin} `) } : {};
-    return page(episodePage(s, e, idx), 200, extra);
+    return page(episodePage(s, e, idx));
   }
 
   return notFound('Página no encontrada');
