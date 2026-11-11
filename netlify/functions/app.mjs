@@ -4,12 +4,15 @@ import { getStore } from '@netlify/blobs';
 const SITE_NAME = process.env.SITE_NAME || 'Videoteca';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD;
+const PER_PAGE = 24;
+const TYPES = ['OVA', 'Serie', 'Película', 'Especial'];
+const STATUSES = ['Finalizado', 'En emisión'];
 
 /* ---------- almacenamiento (Netlify Blobs) ---------- */
 
 async function load() {
   try {
-    const d = await getStore('videoteca').get('videos', { type: 'json' });
+    const d = await getStore('videoteca').get('series', { type: 'json' });
     return Array.isArray(d) ? d : [];
   } catch {
     return [];
@@ -17,7 +20,7 @@ async function load() {
 }
 
 async function save(list) {
-  await getStore('videoteca').setJSON('videos', list);
+  await getStore('videoteca').setJSON('series', list);
 }
 
 /* ---------- utilidades ---------- */
@@ -44,6 +47,8 @@ function isAdmin(req) {
   return Boolean(c) && safeEqual(c, sessionToken());
 }
 
+const isAdult = (req) => parseCookies(req.headers.get('cookie')).mayor === '1';
+
 const attempts = new Map();
 function tooManyAttempts(ip) {
   const now = Date.now();
@@ -54,6 +59,56 @@ function tooManyAttempts(ip) {
   }
   rec.n += 1;
   return rec.n > 10;
+}
+
+const slugify = (s) =>
+  String(s)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'serie';
+
+function uniqueSlug(list, title) {
+  const base = slugify(title);
+  let slug = base;
+  let i = 2;
+  while (list.some((x) => x.slug === slug)) slug = `${base}-${i++}`;
+  return slug;
+}
+
+const byNew = (a, b) => String(b.createdAt).localeCompare(String(a.createdAt));
+
+function ago(iso) {
+  const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
+  if (!(m >= 0) || m < 2) return 'hace un momento';
+  if (m < 60) return `hace ${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `hace ${h} ${h === 1 ? 'hora' : 'horas'}`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `hace ${d} ${d === 1 ? 'día' : 'días'}`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return mo === 1 ? 'hace un mes' : `hace ${mo} meses`;
+  const y = Math.floor(d / 365);
+  return y <= 1 ? 'hace un año' : `hace ${y} años`;
+}
+
+function parseGenres(raw) {
+  const seen = new Set();
+  const out = [];
+  String(raw || '')
+    .split(',')
+    .map((g) => g.trim().slice(0, 30))
+    .filter(Boolean)
+    .forEach((g) => {
+      const k = g.toLowerCase();
+      if (!seen.has(k) && out.length < 15) {
+        seen.add(k);
+        out.push(g);
+      }
+    });
+  return out;
 }
 
 /* ---------- reconocer enlaces de video ---------- */
@@ -146,141 +201,331 @@ const cleanUrl = (v) => {
 
 /* ---------- plantillas ---------- */
 
-function layout({ title, body, script = true, admin = false }) {
-  return `<!doctype html>
+const MESSAGES = {
+  mal: 'Contraseña incorrecta.',
+  muchos: 'Demasiados intentos. Espera unos minutos.',
+  falta: 'Escribe un título.',
+  serieok: 'Serie guardada.',
+  seriebor: 'Serie eliminada.',
+  epok: 'Episodio agregado.',
+  epbor: 'Episodio eliminado.',
+};
+
+const imgTag = (src, cls = '') =>
+  src ? `<img ${cls ? `class="${cls}" ` : ''}src="${esc(src)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : '';
+
+const initial = (s) => `<span class="ph">${esc((s.title[0] || '?').toUpperCase())}</span>`;
+const meta = (s) => [s.type, s.year, s.status].filter(Boolean).join(' · ');
+const tags = (s, n = 15) =>
+  (s.genres || [])
+    .slice(0, n)
+    .map((g) => `<a class="tag" href="/catalogo?genre=${encodeURIComponent(g)}">${esc(g)}</a>`)
+    .join('');
+
+function layout({ title, body, script = false, q = '', bare = false }) {
+  const head = `<!doctype html>
 <html lang="es">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="RATING" content="RTA-5042-1996-1400-1577-RTA">
 <title>${esc(title)}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&family=Figtree:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="/estilos.css">
-</head>
+</head>`;
+  if (bare) return `${head}\n<body>\n${body}\n</body>\n</html>`;
+  return `${head}
 <body>
 <header class="top">
   <a class="brand" href="/">${esc(SITE_NAME)}</a>
-  <a class="admin-link" href="/admin">${admin ? 'Panel' : 'Administrar'}</a>
+  <nav class="nav"><a href="/">Inicio</a><a href="/catalogo">Catálogo</a></nav>
+  <form class="sbox" action="/catalogo" method="get"><input type="search" name="q" value="${esc(q)}" placeholder="Buscar" aria-label="Buscar"></form>
 </header>
 <main class="wrap">
 ${body}
 </main>
+<footer class="foot"><span>${esc(SITE_NAME)} · Solo para mayores de 18 años</span><a href="/admin">Administrar</a></footer>
 ${script ? '<script src="/app.js" defer></script>' : ''}
 </body>
 </html>`;
 }
 
-function card(v) {
-  const thumb = v.thumb
-    ? `<img src="${esc(v.thumb)}" alt="" loading="lazy" referrerpolicy="no-referrer">`
-    : `<span class="ph">${esc((v.title[0] || '?').toUpperCase())}</span>`;
-  return `<a class="card" href="/ver/${esc(v.id)}" data-title="${esc((v.title + ' ' + v.category).toLowerCase())}" data-cat="${esc(v.category)}">
-  <div class="thumb">${thumb}<i class="play" aria-hidden="true"></i></div>
-  <h3>${esc(v.title)}</h3>
-  <p>${esc(v.category)}</p>
+function gatePage(next) {
+  return layout({
+    title: SITE_NAME,
+    bare: true,
+    body: `<main class="gate">
+  <h1>${esc(SITE_NAME)}</h1>
+  <p>Este sitio contiene material para adultos. Para entrar debes ser mayor de 18 años.</p>
+  <form method="post" action="/mayor">
+    <input type="hidden" name="next" value="${esc(next)}">
+    <button class="btn" type="submit">Soy mayor de 18 años</button>
+  </form>
+  <a class="leave" href="https://www.google.com">Salir</a>
+</main>`,
+  });
+}
+
+function poster(s) {
+  return `<a class="poster" href="/media/${esc(s.slug)}">
+  <div class="pimg">${s.cover ? imgTag(s.cover) : initial(s)}<em class="badge">${esc(s.type)}</em></div>
+  <h3>${esc(s.title)}</h3>
 </a>`;
 }
 
-function catalogPage(list) {
-  const cats = [...new Set(list.map((v) => v.category))].sort((a, b) => a.localeCompare(b, 'es'));
-  const body = list.length
-    ? `<div class="head">
-  <h1>Todos los videos</h1>
-  <span class="count" id="count">${list.length} ${list.length === 1 ? 'video' : 'videos'}</span>
-</div>
-<div class="tools">
-  <input id="q" type="search" placeholder="Buscar un video" aria-label="Buscar un video" autocomplete="off">
-  <div class="chips" id="chips">
-    <button class="chip on" data-cat="">Todos</button>
-    ${cats.map((c) => `<button class="chip" data-cat="${esc(c)}">${esc(c)}</button>`).join('')}
+function epCard(e) {
+  const s = e.series;
+  const pic = e.thumb || s.backdrop || s.cover;
+  return `<a class="ep" href="/media/${esc(s.slug)}/${e.n}">
+  <div class="eimg">${pic ? imgTag(pic) : initial(s)}<em class="badge">${esc(ago(e.createdAt))}</em></div>
+  <strong>Episodio ${e.n}</strong>
+  <span>${esc(s.title)}</span>
+</a>`;
+}
+
+function hero(list) {
+  const slides = list
+    .map((s) => {
+      const bg = s.backdrop || s.cover;
+      return `<article class="slide">
+  ${bg ? imgTag(bg, 'bg') : ''}<div class="shade"></div>
+  <div class="info">
+    <h2>${esc(s.title)}</h2>
+    <p class="sub">${esc(meta(s))}</p>
+    <div class="chips">${tags(s, 4)}</div>
+    ${s.synopsis ? `<p class="syn">${esc(s.synopsis)}</p>` : ''}
+    <a class="btn" href="/media/${esc(s.slug)}">Ver ahora</a>
   </div>
-</div>
-<div class="grid" id="grid">${list.map(card).join('')}</div>
-<p class="empty" id="empty" hidden>Ningún video coincide con tu búsqueda.</p>`
-    : `<div class="head"><h1>Todos los videos</h1></div>
-<p class="empty">Aún no hay videos. Agrega el primero desde <a href="/admin">el panel</a>.</p>`;
-  return layout({ title: SITE_NAME, body });
+</article>`;
+    })
+    .join('');
+  return `<section class="hero"><div class="slides" id="slides">${slides}</div>${list.length > 1 ? '<div class="dots" id="dots"></div>' : ''}</section>`;
 }
 
-function playerPage(v, list) {
-  const player =
-    v.kind === 'video'
-      ? `<video controls preload="metadata" playsinline src="${esc(v.embed)}"></video>`
-      : `<iframe src="${esc(v.embed)}" title="${esc(v.title)}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
-  const more = list.filter((x) => x.id !== v.id).slice(0, 8);
-  const body = `<a class="back" href="/">Volver al catálogo</a>
-<div class="player">${player}</div>
-<h1 class="vt">${esc(v.title)}</h1>
-<p class="meta">${esc(v.category)} · desde ${esc(v.provider)}</p>
-${v.description ? `<p class="desc">${esc(v.description)}</p>` : ''}
-${more.length ? `<h2>Más videos</h2><div class="grid">${more.map(card).join('')}</div>` : ''}`;
-  return layout({ title: `${v.title} | ${SITE_NAME}`, body, script: false });
-}
-
-const MESSAGES = {
-  mal: 'Contraseña incorrecta.',
-  muchos: 'Demasiados intentos. Espera unos minutos.',
-  agregado: 'Video agregado.',
-  borrado: 'Video eliminado.',
-  falta: 'Escribe un título y un enlace.',
-};
-
-function adminPage(req, list, note, isError) {
-  if (!ADMIN_PASSWORD) {
+function homePage(list) {
+  if (!list.length) {
     return layout({
-      title: `Panel | ${SITE_NAME}`,
-      script: false,
-      admin: true,
-      body: `<h1>Panel</h1><p class="empty">Define la variable de entorno ADMIN_PASSWORD para activar el panel.</p>`,
+      title: SITE_NAME,
+      body: `<h1>${esc(SITE_NAME)}</h1><p class="empty">Aún no hay contenido. Agrega la primera serie desde <a href="/admin">el panel</a>.</p>`,
     });
   }
-  if (!isAdmin(req)) {
-    return layout({
-      title: `Panel | ${SITE_NAME}`,
-      script: false,
-      admin: true,
-      body: `<h1>Entrar al panel</h1>
-${note ? `<p class="note ${isError ? 'bad' : ''}">${esc(note)}</p>` : ''}
+  const feat = list.filter((s) => s.featured);
+  const slides = (feat.length ? feat : [...list].sort(byNew)).slice(0, 6);
+  const eps = list
+    .flatMap((s) => (s.episodes || []).map((e) => ({ ...e, series: s })))
+    .sort(byNew)
+    .slice(0, 18);
+  const added = [...list].sort(byNew).slice(0, 24);
+  return layout({
+    title: SITE_NAME,
+    script: true,
+    body: `${hero(slides)}
+${eps.length ? `<section class="sec"><div class="sh"><h2>Episodios recientes</h2></div><div class="eps">${eps.map(epCard).join('')}</div></section>` : ''}
+<section class="sec"><div class="sh"><h2>Recientemente agregados</h2><a href="/catalogo">Ver catálogo</a></div><div class="posters">${added.map(poster).join('')}</div></section>`,
+  });
+}
+
+function catalogPage(all, qs) {
+  const q = (qs.get('q') || '').trim();
+  const genre = qs.get('genre') || '';
+  const type = qs.get('type') || '';
+  const status = qs.get('status') || '';
+  const order = qs.get('order') === 'az' ? 'az' : 'recent';
+  const pageNum = Math.max(1, parseInt(qs.get('page'), 10) || 1);
+
+  let list = all.filter(
+    (s) =>
+      (!q || s.title.toLowerCase().includes(q.toLowerCase())) &&
+      (!genre || (s.genres || []).includes(genre)) &&
+      (!type || s.type === type) &&
+      (!status || s.status === status)
+  );
+  list = order === 'az' ? list.sort((a, b) => a.title.localeCompare(b.title, 'es')) : list.sort(byNew);
+
+  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  const pg = Math.min(pageNum, pages);
+  const shown = list.slice((pg - 1) * PER_PAGE, pg * PER_PAGE);
+  const genres = [...new Set(all.flatMap((s) => s.genres || []))].sort((a, b) => a.localeCompare(b, 'es'));
+
+  const opt = (val, label, cur) => `<option value="${esc(val)}"${val === cur ? ' selected' : ''}>${esc(label)}</option>`;
+  const link = (n, label) => {
+    const u = new URLSearchParams(qs);
+    u.set('page', String(n));
+    return `<a href="/catalogo?${esc(u.toString())}">${label}</a>`;
+  };
+
+  return layout({
+    title: `Catálogo | ${SITE_NAME}`,
+    q,
+    body: `<div class="head"><h1>Catálogo</h1><span class="count">${list.length} ${list.length === 1 ? 'resultado' : 'resultados'}</span></div>
+<form class="filters" method="get" action="/catalogo">
+  <input type="search" name="q" value="${esc(q)}" placeholder="Buscar por título" aria-label="Buscar por título">
+  <select name="genre" aria-label="Género"><option value="">Todos los géneros</option>${genres.map((g) => opt(g, g, genre)).join('')}</select>
+  <select name="type" aria-label="Tipo"><option value="">Todos los tipos</option>${TYPES.map((t) => opt(t, t, type)).join('')}</select>
+  <select name="status" aria-label="Estado"><option value="">Todos los estados</option>${STATUSES.map((t) => opt(t, t, status)).join('')}</select>
+  <select name="order" aria-label="Orden">${opt('recent', 'Más recientes', order)}${opt('az', 'A-Z', order)}</select>
+  <button class="btn" type="submit">Filtrar</button>
+</form>
+${shown.length ? `<div class="posters">${shown.map(poster).join('')}</div>` : '<p class="empty">No hay resultados con esos filtros.</p>'}
+${pages > 1 ? `<nav class="pager">${pg > 1 ? link(pg - 1, 'Anterior') : ''}<span>Página ${pg} de ${pages}</span>${pg < pages ? link(pg + 1, 'Siguiente') : ''}</nav>` : ''}`,
+  });
+}
+
+function epList(s, eps, current) {
+  return `<ol class="eplist">${eps
+    .map(
+      (e) => `<li${e.n === current ? ' class="on"' : ''}><a href="/media/${esc(s.slug)}/${e.n}"><span class="num">${e.n}</span><span class="et">${esc(e.title || 'Episodio ' + e.n)}</span><em>${esc(ago(e.createdAt))}</em></a></li>`
+    )
+    .join('')}</ol>`;
+}
+
+function seriePage(s) {
+  const eps = [...(s.episodes || [])].sort((a, b) => a.n - b.n);
+  return layout({
+    title: `${s.title} | ${SITE_NAME}`,
+    body: `<section class="sheet">
+  <div class="scover">${s.cover ? imgTag(s.cover) : initial(s)}</div>
+  <div class="sinfo">
+    <h1>${esc(s.title)}</h1>
+    <p class="sub">${esc(meta(s))}</p>
+    <div class="chips">${tags(s)}</div>
+    ${s.synopsis ? `<p class="syn2">${esc(s.synopsis)}</p>` : ''}
+    ${eps.length ? `<a class="btn" href="/media/${esc(s.slug)}/${eps[0].n}">Ver episodio ${eps[0].n}</a>` : ''}
+  </div>
+</section>
+<h2>Episodios</h2>
+${eps.length ? epList(s, eps, 0) : '<p class="empty">Todavía no hay episodios.</p>'}`,
+  });
+}
+
+function episodePage(s, e) {
+  const eps = [...(s.episodes || [])].sort((a, b) => a.n - b.n);
+  const prev = [...eps].reverse().find((x) => x.n < e.n);
+  const next = eps.find((x) => x.n > e.n);
+  const player =
+    e.kind === 'video'
+      ? `<video controls preload="metadata" playsinline src="${esc(e.embed)}"></video>`
+      : `<iframe src="${esc(e.embed)}" title="${esc(s.title)} episodio ${e.n}" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen></iframe>`;
+  return layout({
+    title: `${s.title} episodio ${e.n} | ${SITE_NAME}`,
+    body: `<a class="back" href="/media/${esc(s.slug)}">${esc(s.title)}</a>
+<div class="player">${player}</div>
+<h1 class="vt">${esc(s.title)} · Episodio ${e.n}</h1>
+${e.title ? `<p class="meta">${esc(e.title)}</p>` : ''}
+<p class="meta">Desde ${esc(e.provider)}</p>
+<nav class="epnav">${prev ? `<a class="btn ghost" href="/media/${esc(s.slug)}/${prev.n}">Anterior</a>` : ''}${next ? `<a class="btn" href="/media/${esc(s.slug)}/${next.n}">Siguiente</a>` : ''}</nav>
+<h2>Episodios</h2>
+${epList(s, eps, e.n)}`,
+  });
+}
+
+/* ---------- panel ---------- */
+
+function adminShell(title, inner) {
+  return layout({ title: `${title} | ${SITE_NAME}`, body: inner });
+}
+
+const noteHtml = (note, bad) => (note ? `<p class="note ${bad ? 'bad' : ''}">${esc(note)}</p>` : '');
+
+function loginPage(note, bad) {
+  if (!ADMIN_PASSWORD) {
+    return adminShell('Panel', '<h1>Panel</h1><p class="empty">Define la variable de entorno ADMIN_PASSWORD para activar el panel.</p>');
+  }
+  return adminShell(
+    'Panel',
+    `<h1>Entrar al panel</h1>
+${noteHtml(note, bad)}
 <form class="form narrow" method="post" action="/admin/entrar">
   <label>Contraseña<input type="password" name="password" required autofocus></label>
   <button class="btn" type="submit">Entrar</button>
-</form>`,
-    });
-  }
-  const rows = list
+</form>`
+  );
+}
+
+function serieFields(s = {}) {
+  const v = (k) => esc(s[k] ?? '');
+  return `<input type="hidden" name="id" value="${esc(s.id || '')}">
+<label>Título<input name="title" maxlength="140" required value="${v('title')}"></label>
+<div class="two">
+  <label>Tipo<select name="type">${TYPES.map((t) => `<option${s.type === t ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
+  <label>Estado<select name="status">${STATUSES.map((t) => `<option${s.status === t ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
+  <label>Año<input name="year" inputmode="numeric" maxlength="4" value="${v('year')}"></label>
+</div>
+<label>Géneros (separados por coma)<input name="genres" value="${esc((s.genres || []).join(', '))}"></label>
+<label>Sinopsis<textarea name="synopsis" rows="4" maxlength="1500">${v('synopsis')}</textarea></label>
+<label>Portada (enlace de imagen vertical)
+  <input name="cover" type="url" value="${v('cover')}" placeholder="https://...">
+  <small>Puedes subir la imagen a ImgBB y pegar el enlace directo.</small>
+</label>
+<label>Imagen ancha para el carrusel (opcional)<input name="backdrop" type="url" value="${v('backdrop')}" placeholder="https://..."></label>
+<label class="check"><input type="checkbox" name="featured" value="1"${s.featured ? ' checked' : ''}> Mostrar en el carrusel de la portada</label>`;
+}
+
+function adminPage(req, list, note, bad) {
+  if (!isAdmin(req)) return loginPage(note, bad);
+  const rows = [...list]
+    .sort(byNew)
     .map(
-      (v) => `<li>
-  <div><strong>${esc(v.title)}</strong><span>${esc(v.category)} · ${esc(v.provider)}</span></div>
-  <form method="post" action="/admin/borrar/${esc(v.id)}"><button class="btn ghost" type="submit">Eliminar</button></form>
+      (s) => `<li>
+  <div><strong>${esc(s.title)}</strong><span>${esc(meta(s))} · ${(s.episodes || []).length} episodios</span></div>
+  <a class="btn ghost" href="/admin/serie/${esc(s.id)}">Editar</a>
 </li>`
     )
     .join('');
-  return layout({
-    title: `Panel | ${SITE_NAME}`,
-    script: false,
-    admin: true,
-    body: `<h1>Panel</h1>
-${note ? `<p class="note ${isError ? 'bad' : ''}">${esc(note)}</p>` : ''}
-<h2>Agregar video</h2>
-<form class="form" method="post" action="/admin/agregar">
-  <label>Título<input name="title" maxlength="120" required></label>
+  return adminShell(
+    'Panel',
+    `<h1>Panel</h1>
+${noteHtml(note, bad)}
+<h2>Nueva serie</h2>
+<form class="form" method="post" action="/admin/serie/guardar">
+  ${serieFields()}
+  <button class="btn" type="submit">Crear serie</button>
+</form>
+<h2>Series (${list.length})</h2>
+<ul class="rows">${rows || '<li><span>No hay series todavía.</span></li>'}</ul>
+<form method="post" action="/admin/salir" class="out"><button class="btn ghost" type="submit">Cerrar sesión</button></form>`
+  );
+}
+
+function adminSeriePage(req, s, note, bad) {
+  if (!isAdmin(req)) return loginPage(note, bad);
+  const eps = [...(s.episodes || [])].sort((a, b) => a.n - b.n);
+  const rows = eps
+    .map(
+      (e) => `<li>
+  <div><strong>Episodio ${e.n}${e.title ? ' · ' + esc(e.title) : ''}</strong><span>${esc(e.provider)}</span></div>
+  <form method="post" action="/admin/serie/${esc(s.id)}/episodio/${e.n}/borrar"><button class="btn ghost" type="submit">Eliminar</button></form>
+</li>`
+    )
+    .join('');
+  return adminShell(
+    s.title,
+    `<a class="back" href="/admin">Volver al panel</a>
+<h1>${esc(s.title)}</h1>
+<p class="meta"><a href="/media/${esc(s.slug)}">Ver en el sitio</a></p>
+${noteHtml(note, bad)}
+<h2>Episodios (${eps.length})</h2>
+<ul class="rows">${rows || '<li><span>No hay episodios todavía.</span></li>'}</ul>
+<h2>Agregar episodio</h2>
+<form class="form" method="post" action="/admin/serie/${esc(s.id)}/episodio">
+  <label>Número<input name="n" inputmode="numeric" maxlength="4" placeholder="Vacío = el siguiente"></label>
+  <label>Título del episodio (opcional)<input name="title" maxlength="120"></label>
   <label>Enlace del video
-    <input name="url" type="url" placeholder="https://mega.nz/file/..." required>
+    <input name="url" type="url" required placeholder="https://mega.nz/file/...">
     <small>Mega, YouTube, Google Drive, Vimeo, Dropbox o enlace directo a un archivo de video.</small>
   </label>
-  <label>Categoría<input name="category" maxlength="40" placeholder="General"></label>
-  <label>Imagen de portada (opcional)
-    <input name="thumb" type="url" placeholder="https://...">
-    <small>Mega y los enlaces directos no generan portada. Sin imagen se muestra la inicial del título.</small>
-  </label>
-  <label>Descripción (opcional)<textarea name="description" rows="3" maxlength="600"></textarea></label>
-  <button class="btn" type="submit">Agregar video</button>
+  <label>Imagen del episodio (opcional)<input name="thumb" type="url" placeholder="https://..."></label>
+  <button class="btn" type="submit">Agregar episodio</button>
 </form>
-<h2>Videos (${list.length})</h2>
-<ul class="rows">${rows || '<li><span>No hay videos todavía.</span></li>'}</ul>
-<form method="post" action="/admin/salir" class="out"><button class="btn ghost" type="submit">Cerrar sesión</button></form>`,
-  });
+<h2>Datos de la serie</h2>
+<form class="form" method="post" action="/admin/serie/guardar">
+  ${serieFields(s)}
+  <button class="btn" type="submit">Guardar cambios</button>
+</form>
+<form method="post" action="/admin/serie/${esc(s.id)}/borrar" class="out"><button class="btn ghost" type="submit">Eliminar serie completa</button></form>`
+  );
 }
 
 /* ---------- estilos y script del cliente ---------- */
@@ -292,87 +537,139 @@ html{color-scheme:dark}
 body{margin:0;background:var(--bg);color:var(--text);font:400 16px/1.55 'Figtree',system-ui,sans-serif}
 a{color:inherit}
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
-.top{display:flex;justify-content:space-between;align-items:center;padding:18px clamp(16px,4vw,40px);border-bottom:1px solid var(--line)}
-.brand{font:800 1.35rem 'Bricolage Grotesque',sans-serif;text-decoration:none;letter-spacing:-.01em}
-.admin-link{color:var(--muted);font-size:.9rem;text-decoration:none}
-.admin-link:hover{color:var(--text)}
-.wrap{max-width:1200px;margin:0 auto;padding:32px clamp(16px,4vw,40px) 80px}
 h1,h2,h3{font-family:'Bricolage Grotesque',sans-serif;line-height:1.15;margin:0}
 h1{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;letter-spacing:-.02em}
-h2{font-size:1.3rem;margin:40px 0 16px}
-.head{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:20px}
-.count{color:var(--muted)}
-.tools{display:flex;flex-direction:column;gap:14px;margin-bottom:28px}
-input,textarea{width:100%;background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:12px 14px;font:inherit}
+h2{font-size:1.35rem;margin:40px 0 16px}
+.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:20px;flex-wrap:wrap;padding:12px clamp(16px,4vw,40px);background:rgba(27,21,48,.94);border-bottom:1px solid var(--line)}
+.brand{font:800 1.35rem 'Bricolage Grotesque',sans-serif;text-decoration:none;letter-spacing:-.01em}
+.nav{display:flex;gap:18px}
+.nav a{color:var(--muted);text-decoration:none}
+.nav a:hover{color:var(--text)}
+.sbox{margin-left:auto;flex:0 1 280px}
+.wrap{max-width:1240px;margin:0 auto;padding:24px clamp(16px,4vw,40px) 70px}
+.foot{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:24px clamp(16px,4vw,40px);border-top:1px solid var(--line);color:var(--muted);font-size:.9rem}
+.foot a{text-decoration:none}
+input,textarea,select{width:100%;background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:11px 14px;font:inherit}
 input::placeholder,textarea::placeholder{color:#7d74a0}
-.chips{display:flex;gap:8px;flex-wrap:wrap}
-.chip{background:transparent;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font:inherit;font-size:.9rem;cursor:pointer}
-.chip:hover{color:var(--text)}
-.chip.on{background:var(--accent);border-color:var(--accent);color:#2a1d05;font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:26px 20px}
-.card{text-decoration:none;display:block}
-.thumb{position:relative;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:var(--surface);border:1px solid var(--line)}
-.thumb img{width:100%;height:100%;object-fit:cover;display:block}
-.ph{display:grid;place-items:center;height:100%;font:800 3rem 'Bricolage Grotesque',sans-serif;color:var(--line)}
-.play{position:absolute;right:10px;bottom:10px;width:38px;height:38px;border-radius:50%;background:var(--accent)}
-.play::after{content:'';position:absolute;left:15px;top:11px;border-left:12px solid #2a1d05;border-top:8px solid transparent;border-bottom:8px solid transparent}
-.card:hover .thumb,.card:focus-visible .thumb{border-color:var(--accent)}
-.card h3{font-size:1.05rem;font-weight:600;margin-top:10px}
-.card p{margin:2px 0 0;color:var(--muted);font-size:.9rem}
-.empty{color:var(--muted);padding:40px 0}
+.btn{display:inline-block;align-self:flex-start;background:var(--accent);color:#2a1d05;border:0;border-radius:8px;padding:11px 20px;font:600 1rem 'Figtree',sans-serif;cursor:pointer;text-decoration:none}
+.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);padding:7px 14px;font-size:.9rem}
+.btn.ghost:hover{border-color:var(--accent);color:var(--accent)}
+.empty{color:var(--muted);padding:32px 0}
 .empty a{color:var(--accent)}
-.back{display:inline-block;color:var(--muted);text-decoration:none;margin-bottom:16px;font-size:.95rem}
+.badge{position:absolute;top:8px;left:8px;background:var(--accent);color:#2a1d05;font-style:normal;font-weight:600;font-size:.72rem;padding:2px 9px;border-radius:999px}
+.ph{display:grid;place-items:center;height:100%;font:800 3rem 'Bricolage Grotesque',sans-serif;color:var(--line)}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.tag{border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:.85rem;color:var(--muted);text-decoration:none;background:rgba(27,21,48,.6)}
+.tag:hover{color:var(--text);border-color:var(--accent)}
+.hero{position:relative;border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+.slides{display:flex;overflow-x:auto;scroll-snap-type:x mandatory;scrollbar-width:none}
+.slides::-webkit-scrollbar{display:none}
+.slide{position:relative;flex:0 0 100%;scroll-snap-align:start;height:clamp(300px,50vw,460px);background:var(--surface)}
+.slide .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(27,21,48,.96) 0%,rgba(27,21,48,.65) 55%,rgba(27,21,48,.1) 100%)}
+.info{position:absolute;left:0;bottom:0;max-width:600px;padding:clamp(16px,4vw,40px);display:flex;flex-direction:column;gap:10px;align-items:flex-start}
+.info h2{margin:0;font-size:clamp(1.5rem,3.6vw,2.4rem);font-weight:800}
+.sub{margin:0;color:var(--muted)}
+.syn{margin:0;color:#ddd6f5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.dots{position:absolute;right:16px;bottom:14px;display:flex;gap:6px}
+.dots button{width:10px;height:10px;border-radius:50%;border:0;background:var(--line);padding:0;cursor:pointer}
+.dots button.on{background:var(--accent)}
+.sh{display:flex;justify-content:space-between;align-items:baseline;gap:16px}
+.sh h2{margin:40px 0 16px}
+.sh a{color:var(--muted);text-decoration:none;font-size:.95rem}
+.sh a:hover{color:var(--accent)}
+.eps{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:22px 18px}
+.ep{display:block;text-decoration:none}
+.eimg,.pimg,.scover{position:relative;overflow:hidden;background:var(--surface);border:1px solid var(--line);border-radius:10px}
+.eimg{aspect-ratio:16/9}
+.eimg img,.pimg img,.scover img{width:100%;height:100%;object-fit:cover;display:block}
+.ep strong{display:block;margin-top:8px}
+.ep span{display:block;color:var(--muted);font-size:.9rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.posters{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:22px 16px}
+.poster{display:block;text-decoration:none}
+.pimg{aspect-ratio:2/3}
+.poster h3{font-size:.95rem;font-weight:600;margin-top:8px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ep:hover .eimg,.poster:hover .pimg,.ep:focus-visible .eimg,.poster:focus-visible .pimg{border-color:var(--accent)}
+.head{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+.count{color:var(--muted)}
+.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:28px}
+.filters .btn{width:100%}
+.pager{display:flex;justify-content:center;align-items:center;gap:20px;margin-top:36px;color:var(--muted)}
+.pager a{color:var(--accent)}
+.sheet{display:grid;grid-template-columns:220px 1fr;gap:28px;align-items:start}
+.scover{aspect-ratio:2/3}
+.sinfo{display:flex;flex-direction:column;gap:12px;align-items:flex-start}
+.syn2{margin:0;max-width:70ch;color:#ddd6f5}
+.eplist{list-style:none;margin:0;padding:0;max-width:820px}
+.eplist a{display:flex;align-items:center;gap:14px;padding:12px 10px;border-bottom:1px solid var(--line);text-decoration:none}
+.eplist a:hover{background:var(--surface)}
+.eplist .num{flex:0 0 38px;height:38px;display:grid;place-items:center;border-radius:8px;background:var(--surface);border:1px solid var(--line);font-weight:600}
+.eplist .et{flex:1}
+.eplist em{font-style:normal;color:var(--muted);font-size:.85rem}
+.eplist li.on a{background:var(--surface)}
+.eplist li.on .num{background:var(--accent);color:#2a1d05;border-color:var(--accent)}
+.back{display:inline-block;color:var(--muted);text-decoration:none;margin-bottom:14px;font-size:.95rem}
 .back:hover{color:var(--text)}
 .player{aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden;border:1px solid var(--line)}
 .player iframe,.player video{width:100%;height:100%;border:0;display:block}
-.vt{font-size:clamp(1.5rem,3.5vw,2.1rem);margin-top:20px}
+.vt{font-size:clamp(1.4rem,3.4vw,2rem);margin-top:18px}
 .meta{color:var(--muted);margin:6px 0 0}
-.desc{max-width:70ch;margin:16px 0 0;color:#ddd6f5}
-.form{display:flex;flex-direction:column;gap:16px;max-width:560px}
+.epnav{display:flex;gap:10px;margin-top:16px}
+.form{display:flex;flex-direction:column;gap:16px;max-width:600px}
 .form.narrow{max-width:360px}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 label{display:flex;flex-direction:column;gap:6px;font-weight:500}
+label.check{flex-direction:row;align-items:center;gap:10px}
+label.check input{width:auto}
 small{color:var(--muted);font-weight:400}
-.btn{align-self:flex-start;background:var(--accent);color:#2a1d05;border:0;border-radius:8px;padding:11px 20px;font:600 1rem 'Figtree',sans-serif;cursor:pointer}
-.btn.ghost{background:transparent;color:var(--text);border:1px solid var(--line);padding:7px 14px;font-size:.9rem}
-.btn.ghost:hover{border-color:var(--bad);color:var(--bad)}
-.note{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 14px;max-width:560px}
+.note{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 14px;max-width:600px}
 .note.bad{border-color:var(--bad);color:var(--bad)}
 .rows{list-style:none;margin:0;padding:0;max-width:760px}
 .rows li{display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}
 .rows span{display:block;color:var(--muted);font-size:.9rem}
 .out{margin-top:32px}
-@media (prefers-reduced-motion:no-preference){.thumb{transition:border-color .15s}}
+.gate{max-width:460px;margin:0 auto;padding:18vh 24px 40px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:18px}
+.gate p{color:var(--muted);margin:0}
+.gate .leave{color:var(--muted);font-size:.9rem}
+@media (max-width:640px){.sheet{grid-template-columns:1fr}.scover{max-width:200px}.sbox{flex-basis:100%;margin-left:0}.nav{margin-left:auto}}
+@media (prefers-reduced-motion:no-preference){.eimg,.pimg{transition:border-color .15s}}
 `;
 
 const CLIENT_JS = `
 (function () {
-  var q = document.getElementById('q');
-  var grid = document.getElementById('grid');
-  if (!q || !grid) return;
-  var cards = Array.prototype.slice.call(grid.children);
-  var chips = Array.prototype.slice.call(document.querySelectorAll('.chip'));
-  var empty = document.getElementById('empty');
-  var count = document.getElementById('count');
-  var cat = '';
-  function apply() {
-    var t = q.value.trim().toLowerCase();
-    var shown = 0;
-    cards.forEach(function (c) {
-      var ok = (!cat || c.dataset.cat === cat) && (!t || c.dataset.title.indexOf(t) !== -1);
-      c.hidden = !ok;
-      if (ok) shown++;
-    });
-    empty.hidden = shown !== 0;
-    count.textContent = shown + (shown === 1 ? ' video' : ' videos');
+  var sl = document.getElementById('slides');
+  if (!sl) return;
+  var slides = Array.prototype.slice.call(sl.children);
+  var dots = document.getElementById('dots');
+  var cur = 0;
+  var paused = false;
+  function mark() {
+    if (!dots) return;
+    Array.prototype.forEach.call(dots.children, function (b, k) { b.className = k === cur ? 'on' : ''; });
   }
-  q.addEventListener('input', apply);
-  chips.forEach(function (b) {
-    b.addEventListener('click', function () {
-      cat = b.dataset.cat;
-      chips.forEach(function (x) { x.classList.toggle('on', x === b); });
-      apply();
+  function go(k) {
+    cur = k;
+    sl.scrollTo({ left: k * sl.clientWidth, behavior: 'smooth' });
+    mark();
+  }
+  if (dots) {
+    slides.forEach(function (_, k) {
+      var b = document.createElement('button');
+      b.setAttribute('aria-label', 'Ir a la imagen ' + (k + 1));
+      b.addEventListener('click', function () { paused = true; go(k); });
+      dots.appendChild(b);
     });
+    mark();
+  }
+  sl.addEventListener('scroll', function () {
+    var k = Math.round(sl.scrollLeft / sl.clientWidth);
+    if (k !== cur) { cur = k; mark(); }
   });
+  sl.addEventListener('pointerdown', function () { paused = true; });
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (!reduce && slides.length > 1) {
+    setInterval(function () { if (!paused) go((cur + 1) % slides.length); }, 7000);
+  }
 })();
 `;
 
@@ -399,49 +696,62 @@ const send = (body, type, status = 200, extra = {}) =>
 const page = (html, status = 200) => send(html, 'text/html; charset=utf-8', status);
 const go = (req, to, extra = {}) =>
   new Response(null, { status: 303, headers: { Location: new URL(to, req.url).href, ...extra } });
-const notFound = (title, msg) =>
-  page(layout({ title, script: false, body: `<h1>${msg}</h1><p class="empty"><a href="/">Volver al catálogo</a></p>` }), 404);
+const notFound = (msg) =>
+  page(layout({ title: 'No encontrado', body: `<h1>${esc(msg)}</h1><p class="empty"><a href="/">Volver al inicio</a></p>` }), 404);
+
+const safeNext = (n) => (/^\/(?![\/\\])/.test(String(n || '')) ? String(n) : '/');
+const isBadMsg = (k) => k === 'mal' || k === 'muchos' || k === 'falta';
 
 /* ---------- rutas ---------- */
 
 export default async (req, context) => {
   const url = new URL(req.url);
   const p = url.pathname.replace(/\/+$/, '') || '/';
+  const isGet = req.method === 'GET' || req.method === 'HEAD';
 
-  if (req.method === 'GET' || req.method === 'HEAD') {
+  if (isGet) {
     if (p === '/estilos.css') return send(CSS, 'text/css; charset=utf-8', 200, { 'Cache-Control': 'public, max-age=300' });
     if (p === '/app.js') return send(CLIENT_JS, 'application/javascript; charset=utf-8', 200, { 'Cache-Control': 'public, max-age=300' });
     if (p === '/salud') return send('ok', 'text/plain');
-
-    if (p === '/') return page(catalogPage(await load()));
-
-    const ver = p.match(/^\/ver\/([\w-]+)$/);
-    if (ver) {
-      const list = await load();
-      const v = list.find((x) => x.id === ver[1]);
-      return v ? page(playerPage(v, list)) : notFound('No encontrado', 'Video no encontrado');
-    }
-
-    if (p === '/api/videos') {
-      const list = (await load()).map(({ id, title, category, provider, thumb, description }) => ({ id, title, category, provider, thumb, description }));
-      return send(JSON.stringify(list), 'application/json; charset=utf-8');
-    }
-
-    if (p === '/admin') {
-      const k = url.searchParams.get('m');
-      const note = MESSAGES[k] || '';
-      return page(adminPage(req, await load(), note, k === 'mal' || k === 'muchos' || k === 'falta'));
-    }
-    return notFound('No encontrado', 'Página no encontrada');
   }
 
+  let form = null;
   if (req.method === 'POST') {
     const origin = req.headers.get('origin');
     if (origin && new URL(origin).host !== url.host) return send('Solicitud rechazada', 'text/plain', 403);
-
     const raw = await req.text();
-    if (raw.length > 20000) return send('Solicitud demasiado grande', 'text/plain', 413);
-    const form = new URLSearchParams(raw);
+    if (raw.length > 30000) return send('Solicitud demasiado grande', 'text/plain', 413);
+    form = new URLSearchParams(raw);
+  } else if (!isGet) {
+    return send('Método no permitido', 'text/plain', 405);
+  }
+
+  /* confirmación de mayoría de edad */
+  if (req.method === 'POST' && p === '/mayor') {
+    const secure = url.protocol === 'https:' ? '; Secure' : '';
+    return go(req, safeNext(form.get('next')), {
+      'Set-Cookie': `mayor=1; HttpOnly; SameSite=Lax; Path=/; Max-Age=${60 * 60 * 24 * 365}${secure}`,
+    });
+  }
+
+  /* panel */
+  if (p === '/admin' || p.startsWith('/admin/')) {
+    const list = await load();
+
+    if (isGet) {
+      if (p === '/admin') {
+        const k = url.searchParams.get('m');
+        return page(adminPage(req, list, MESSAGES[k] || '', isBadMsg(k)));
+      }
+      const m = p.match(/^\/admin\/serie\/([\w-]+)$/);
+      if (m) {
+        const s = list.find((x) => x.id === m[1]);
+        if (!s) return notFound('Serie no encontrada');
+        const k = url.searchParams.get('m');
+        return page(adminSeriePage(req, s, MESSAGES[k] || '', isBadMsg(k)));
+      }
+      return notFound('Página no encontrada');
+    }
 
     if (p === '/admin/entrar') {
       if (!ADMIN_PASSWORD) return go(req, '/admin');
@@ -457,38 +767,100 @@ export default async (req, context) => {
       return go(req, '/admin', { 'Set-Cookie': 'sesion=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' });
     }
 
-    if (p === '/admin/agregar') {
-      if (!isAdmin(req)) return go(req, '/admin');
-      const title = String(form.get('title') || '').trim().slice(0, 120);
-      const link = String(form.get('url') || '').trim();
-      if (!title || !link) return go(req, '/admin?m=falta');
-      const src = parseSource(link);
-      const list = await load();
-      if (src.error) return page(adminPage(req, list, src.error, true));
-      list.unshift({
-        id: crypto.randomUUID().slice(0, 8),
+    if (!isAdmin(req)) return go(req, '/admin');
+
+    if (p === '/admin/serie/guardar') {
+      const title = String(form.get('title') || '').trim().slice(0, 140);
+      if (!title) return go(req, '/admin?m=falta');
+      const year = String(form.get('year') || '').trim();
+      const data = {
         title,
-        category: String(form.get('category') || '').trim().slice(0, 40) || 'General',
-        description: String(form.get('description') || '').trim().slice(0, 600),
+        type: TYPES.includes(form.get('type')) ? form.get('type') : TYPES[0],
+        status: STATUSES.includes(form.get('status')) ? form.get('status') : STATUSES[0],
+        year: /^\d{4}$/.test(year) ? year : '',
+        genres: parseGenres(form.get('genres')),
+        synopsis: String(form.get('synopsis') || '').trim().slice(0, 1500),
+        cover: cleanUrl(form.get('cover')),
+        backdrop: cleanUrl(form.get('backdrop')),
+        featured: form.get('featured') === '1',
+      };
+      let s = form.get('id') ? list.find((x) => x.id === form.get('id')) : null;
+      if (s) {
+        Object.assign(s, data);
+      } else {
+        s = {
+          id: crypto.randomUUID().slice(0, 8),
+          slug: uniqueSlug(list, title),
+          episodes: [],
+          createdAt: new Date().toISOString(),
+          ...data,
+        };
+        list.unshift(s);
+      }
+      await save(list);
+      return go(req, `/admin/serie/${s.id}?m=serieok`);
+    }
+
+    const del = p.match(/^\/admin\/serie\/([\w-]+)\/borrar$/);
+    if (del) {
+      await save(list.filter((x) => x.id !== del[1]));
+      return go(req, '/admin?m=seriebor');
+    }
+
+    const add = p.match(/^\/admin\/serie\/([\w-]+)\/episodio$/);
+    if (add) {
+      const s = list.find((x) => x.id === add[1]);
+      if (!s) return notFound('Serie no encontrada');
+      const src = parseSource(String(form.get('url') || ''));
+      if (src.error) return page(adminSeriePage(req, s, src.error, true));
+      let n = parseInt(form.get('n'), 10);
+      if (!(n >= 1 && n <= 9999)) n = Math.max(0, ...s.episodes.map((e) => e.n)) + 1;
+      if (s.episodes.some((e) => e.n === n)) return page(adminSeriePage(req, s, 'Ese número de episodio ya existe.', true));
+      s.episodes.push({
+        n,
+        title: String(form.get('title') || '').trim().slice(0, 120),
         kind: src.kind,
         provider: src.provider,
         embed: src.embed,
         thumb: cleanUrl(form.get('thumb')) || src.thumb || '',
         createdAt: new Date().toISOString(),
       });
+      s.episodes.sort((a, b) => a.n - b.n);
       await save(list);
-      return go(req, '/admin?m=agregado');
+      return go(req, `/admin/serie/${s.id}?m=epok`);
     }
 
-    const del = p.match(/^\/admin\/borrar\/([\w-]+)$/);
-    if (del) {
-      if (!isAdmin(req)) return go(req, '/admin');
-      await save((await load()).filter((v) => v.id !== del[1]));
-      return go(req, '/admin?m=borrado');
+    const delEp = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/borrar$/);
+    if (delEp) {
+      const s = list.find((x) => x.id === delEp[1]);
+      if (!s) return notFound('Serie no encontrada');
+      s.episodes = s.episodes.filter((e) => e.n !== Number(delEp[2]));
+      await save(list);
+      return go(req, `/admin/serie/${s.id}?m=epbor`);
     }
+
+    return notFound('Página no encontrada');
   }
 
-  return notFound('No encontrado', 'Página no encontrada');
+  /* sitio público */
+  if (!isGet) return notFound('Página no encontrada');
+  if (!isAdult(req)) return page(gatePage(url.pathname + url.search));
+
+  const list = await load();
+
+  if (p === '/') return page(homePage(list));
+  if (p === '/catalogo') return page(catalogPage(list, url.searchParams));
+
+  const m = p.match(/^\/media\/([\w-]+)(?:\/(\d+))?$/);
+  if (m) {
+    const s = list.find((x) => x.slug === m[1]);
+    if (!s) return notFound('No encontrado');
+    if (!m[2]) return page(seriePage(s));
+    const e = (s.episodes || []).find((x) => x.n === Number(m[2]));
+    return e ? page(episodePage(s, e)) : notFound('Episodio no encontrado');
+  }
+
+  return notFound('Página no encontrada');
 };
 
 export const config = { path: '/*' };
