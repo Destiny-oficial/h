@@ -1,6 +1,9 @@
 import crypto from 'node:crypto';
 import { getStore } from '@netlify/blobs';
 
+// lectura fuerte: los cambios se ven al instante (la lectura normal tarda hasta 60 s en actualizarse)
+const store = () => getStore({ name: 'videoteca', consistency: 'strong' });
+
 const SITE_NAME = process.env.SITE_NAME || 'Videoteca';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD;
@@ -14,20 +17,31 @@ async function uploadImage(file) {
   if (!IMGBB_KEY) throw new Error('Falta la variable IMGBB_KEY en Netlify para subir imágenes.');
   if (!String(file.type).startsWith('image/')) throw new Error('El archivo no es una imagen.');
   if (file.size > 5 * 1024 * 1024) throw new Error('La imagen pesa más de 5 MB.');
+  // igual que el ejemplo: la imagen va en base64 dentro de un formulario multipart
   const body = new FormData();
-  body.append('image', file, file.name || 'imagen.jpg');
-  let j = null;
-  let ok = false;
+  body.append('image', Buffer.from(await file.arrayBuffer()).toString('base64'));
+  let res;
+  let raw = '';
   try {
-    const res = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(IMGBB_KEY), { method: 'POST', body });
-    ok = res.ok;
-    j = await res.json();
-  } catch {
-    throw new Error('No se pudo conectar con ImgBB. Intenta de nuevo.');
+    res = await fetch('https://api.imgbb.com/1/upload?key=' + encodeURIComponent(IMGBB_KEY), {
+      method: 'POST',
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Videoteca/1.0)' },
+      body,
+    });
+    raw = await res.text();
+  } catch (e) {
+    const code = e && e.cause && e.cause.code ? ` (${e.cause.code})` : '';
+    throw new Error(`No se pudo conectar con ImgBB${code}. Intenta de nuevo.`);
   }
-  if (!ok || !j || !j.success || !j.data || !j.data.url) {
-    const why = j && j.error && j.error.message ? `: ${j.error.message}` : '';
-    throw new Error(`ImgBB no aceptó la imagen${why}`);
+  let j = null;
+  try {
+    j = JSON.parse(raw);
+  } catch {
+    /* respuesta que no es JSON */
+  }
+  if (!res.ok || !j || !j.success || !j.data || !j.data.url) {
+    const why = j && j.error && j.error.message ? j.error.message : raw.replace(/\s+/g, ' ').slice(0, 80);
+    throw new Error(`ImgBB no aceptó la imagen (código ${res.status})${why ? ': ' + why : ''}`);
   }
   return j.data.url;
 }
@@ -46,7 +60,7 @@ function normalizeEp(e) {
 
 async function load() {
   try {
-    const d = await getStore('videoteca').get('series', { type: 'json' });
+    const d = await store().get('series', { type: 'json' });
     if (!Array.isArray(d)) return [];
     d.forEach((s) => {
       s.episodes = (s.episodes || []).map(normalizeEp);
@@ -58,7 +72,7 @@ async function load() {
 }
 
 async function save(list) {
-  await getStore('videoteca').setJSON('series', list);
+  await store().setJSON('series', list);
 }
 
 /* ---------- utilidades ---------- */
@@ -855,15 +869,15 @@ async function tg(method, payload) {
 const stKey = (chat) => `tg-${chat}`;
 async function getState(chat) {
   try {
-    return await getStore('videoteca').get(stKey(chat), { type: 'json' });
+    return await store().get(stKey(chat), { type: 'json' });
   } catch {
     return null;
   }
 }
-const setState = (chat, st) => getStore('videoteca').setJSON(stKey(chat), st);
+const setState = (chat, st) => store().setJSON(stKey(chat), st);
 async function clearState(chat) {
   try {
-    await getStore('videoteca').delete(stKey(chat));
+    await store().delete(stKey(chat));
   } catch {
     /* sin estado */
   }
@@ -872,13 +886,13 @@ async function clearState(chat) {
 const B = (text, data) => ({ text, callback_data: data });
 async function getAccess() {
   try {
-    const d = await getStore('videoteca').get('tg-access', { type: 'json' });
+    const d = await store().get('tg-access', { type: 'json' });
     return Array.isArray(d) ? d : [];
   } catch {
     return [];
   }
 }
-const setAccess = (list) => getStore('videoteca').setJSON('tg-access', list);
+const setAccess = (list) => store().setJSON('tg-access', list);
 
 async function roleOf(userId) {
   const id = String(userId);
@@ -1428,8 +1442,7 @@ async function onUpdate(u, origin) {
 
   try {
     if (cb) {
-      await tg('answerCallbackQuery', { callback_query_id: cb.id });
-      await onCallback(c, String(cb.data || ''));
+      await Promise.all([tg('answerCallbackQuery', { callback_query_id: cb.id }), onCallback(c, String(cb.data || ''))]);
     } else {
       await onMessage(c, msg);
     }
