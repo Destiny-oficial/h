@@ -884,12 +884,7 @@ async function roleOf(userId) {
   const id = String(userId);
   if (TG_OWNERS.includes(id)) return 'owner';
   const list = await getAccess();
-  if (list.some((x) => x.id === id)) return 'premium';
-  for (const g of list.filter((x) => x.id.startsWith('-')).slice(0, 10)) {
-    const r = await tg('getChatMember', { chat_id: Number(g.id), user_id: Number(id) });
-    if (r.ok && r.result && ['creator', 'administrator', 'member'].includes(r.result.status)) return 'premium';
-  }
-  return null;
+  return list.some((x) => x.id === id) ? 'premium' : null;
 }
 
 async function ownerCommand(c, text) {
@@ -919,7 +914,10 @@ async function ownerCommand(c, text) {
   list.push(item);
   await setAccess(list);
   if (!raw.startsWith('-')) await tg('sendMessage', { chat_id: Number(raw), text: 'Ya tienes acceso al bot. Escribe /start para empezar.' });
-  return show(c, `✅ Acceso dado a ${fmt(item)}.`);
+  const nota = raw.startsWith('-')
+    ? '\nSus miembros podrán usar el bot dentro del grupo con /menu. En privado solo responde a quien tenga su propio ID premium.\nEl bot debe estar en el grupo y con el modo privado desactivado en BotFather (/setprivacy, Disable).'
+    : '';
+  return show(c, `✅ Acceso dado a ${fmt(item)}.${nota}`);
 }
 
 const trunc = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
@@ -946,7 +944,7 @@ async function mutate(sid, fn) {
 /* ---------- pantallas ---------- */
 
 async function showMain(c, note = '') {
-  const owner = c.role === 'owner' ? '\n\nDueño: /premium ID · /quitarpremium ID · /premiums' : '';
+  const owner = c.role === 'owner' && !c.group ? '\n\nDueño: /premium ID · /quitarpremium ID · /premiums' : '';
   await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción:${owner}`, [
     [B('➕ Nueva serie', 'ns')],
     [B('📚 Mis series', 'ls:0')],
@@ -1136,7 +1134,7 @@ async function parseValue(step, msg) {
 }
 
 async function startNew(c) {
-  await setState(c.chat, { flow: 'new', i: 0, d: {} });
+  await setState(c.key, { flow: 'new', i: 0, d: {} });
   await promptStep(c, { flow: 'new', i: 0, d: {} });
 }
 
@@ -1144,13 +1142,13 @@ async function startEdit(c, sid, code) {
   const k = SERIE_CODES[code];
   if (!k) return showEditMenu(c, sid);
   const st = { flow: 'edit', sid, k };
-  await setState(c.chat, st);
+  await setState(c.key, st);
   await promptStep(c, st);
 }
 
 async function startAddEp(c, sid) {
   const st = { flow: 'addep', sid, i: 0, d: {} };
-  await setState(c.chat, st);
+  await setState(c.key, st);
   await promptStep(c, st);
 }
 
@@ -1158,7 +1156,7 @@ async function startEditEp(c, sid, n, code) {
   const k = EP_CODES[code];
   if (!k) return showEpisode(c, sid, n);
   const st = { flow: 'editep', sid, n, k };
-  await setState(c.chat, st);
+  await setState(c.key, st);
   await promptStep(c, st);
 }
 
@@ -1182,7 +1180,7 @@ async function finishNew(c, st) {
   };
   list.unshift(s);
   await save(list);
-  await clearState(c.chat);
+  await clearState(c.key);
   await showSeries(c, s.id, '✅ Serie creada. Ahora puedes agregar sus episodios.');
 }
 
@@ -1204,7 +1202,7 @@ async function finishAddEp(c, st) {
       s.episodes.sort((a, b) => a.n - b.n);
     }
   });
-  await clearState(c.chat);
+  await clearState(c.key);
   if (!s) return showMain(c, 'Esa serie ya no existe.');
   await showEpisode(c, st.sid, finalN, '✅ Episodio guardado.');
 }
@@ -1215,7 +1213,7 @@ async function applyValue(c, st, step, value) {
     if (value !== undefined) st.d[step.k] = value;
     st.i += 1;
     if (NEW_ORDER[st.i]) {
-      await setState(c.chat, st);
+      await setState(c.key, st);
       return promptStep(c, st);
     }
     return finishNew(c, st);
@@ -1225,7 +1223,7 @@ async function applyValue(c, st, step, value) {
     await mutate(st.sid, (s) => {
       s[st.k] = st.k === 'title' ? String(value).slice(0, 140) : value;
     });
-    await clearState(c.chat);
+    await clearState(c.key);
     return showSeries(c, st.sid, '✅ Guardado.');
   }
 
@@ -1239,7 +1237,7 @@ async function applyValue(c, st, step, value) {
     }
     st.i += 1;
     if (EP_ORDER[st.i]) {
-      await setState(c.chat, st);
+      await setState(c.key, st);
       return promptStep(c, st);
     }
     return finishAddEp(c, st);
@@ -1267,7 +1265,7 @@ async function applyValue(c, st, step, value) {
       } else if (st.k === 'add') e.servers = [...e.servers, ...value.servers].slice(0, 12);
     });
     if (err) return promptStep(c, st, err);
-    await clearState(c.chat);
+    await clearState(c.key);
     return showEpisode(c, st.sid, nn, '✅ Guardado.');
   }
 }
@@ -1275,7 +1273,7 @@ async function applyValue(c, st, step, value) {
 async function onInput(c, st, msg) {
   const step = stepOf(st);
   if (!step) {
-    await clearState(c.chat);
+    await clearState(c.key);
     return showMain(c);
   }
   if (step.kind === 'choice' || step.kind === 'yesno') return promptStep(c, st, 'Usa los botones para elegir.');
@@ -1285,11 +1283,11 @@ async function onInput(c, st, msg) {
 }
 
 async function onWizard(c, parts) {
-  const st = await getState(c.chat);
+  const st = await getState(c.key);
   if (!st) return showMain(c);
   const [a, b] = parts;
   if (a === 'cx') {
-    await clearState(c.chat);
+    await clearState(c.key);
     if (st.sid && st.n) return showEpisode(c, st.sid, st.n);
     if (st.sid) return showSeries(c, st.sid);
     return showMain(c);
@@ -1310,13 +1308,13 @@ async function onCallback(c, data) {
   if (op === 'w') return onWizard(c, [x, y]);
 
   if (op === 'm') {
-    await clearState(c.chat);
+    await clearState(c.key);
     return showMain(c);
   }
   if (op === 'ls') return showSeriesList(c, Number(x) || 0);
   if (op === 'ns') return startNew(c);
   if (op === 's') {
-    await clearState(c.chat);
+    await clearState(c.key);
     return showSeries(c, x);
   }
   if (op === 'ed') return showEditMenu(c, x);
@@ -1376,15 +1374,16 @@ async function onCallback(c, data) {
 async function onMessage(c, msg) {
   const text = String(msg.text || '').trim();
   if (/^\/(premium|quitarpremium|premiums)\b/i.test(text)) {
+    if (c.group) return;
     if (c.role === 'owner') return ownerCommand(c, text);
     return show(c, 'Ese comando es solo para el dueño.');
   }
   if (/^\/(start|menu|cancelar|cancel)\b/i.test(text)) {
-    await clearState(c.chat);
+    await clearState(c.key);
     return showMain(c);
   }
-  const st = await getState(c.chat);
-  if (!st) return showMain(c, 'Usa los botones para administrar el sitio.');
+  const st = await getState(c.key);
+  if (!st) return c.group ? undefined : showMain(c, 'Usa los botones para administrar el sitio.');
   return onInput(c, st, msg);
 }
 
@@ -1393,28 +1392,38 @@ async function onUpdate(u, origin) {
   const msg = cb ? cb.message : u.message;
   if (!msg || !msg.chat) return;
   const from = (cb ? cb.from : msg.from) || {};
+  const isOwner = TG_OWNERS.includes(String(from.id));
+  const isGroup = msg.chat.type !== 'private';
+  const text = String(msg.text || '').trim();
+  const c = {
+    chat: msg.chat.id,
+    key: `${msg.chat.id}-${from.id}`,
+    origin,
+    msgId: cb ? msg.message_id : 0,
+    group: isGroup,
+    role: null,
+  };
 
-  if (msg.chat.type !== 'private') {
-    const t = String(msg.text || '').trim();
-    if (!cb && TG_OWNERS.includes(String(from.id)) && /^\/premium(@\w+)?$/i.test(t)) {
-      return ownerCommand({ chat: msg.chat.id, origin, msgId: 0, role: 'owner' }, `/premium ${msg.chat.id}`);
+  if (isGroup) {
+    // el dueño agrega o quita el grupo escribiendo el comando dentro de él
+    const m = text.match(/^\/(premium|quitarpremium)(?:@\w+)?$/i);
+    if (!cb && isOwner && m) return ownerCommand({ ...c, role: 'owner' }, `/${m[1].toLowerCase()} ${msg.chat.id}`);
+    const allowed = isOwner || (await getAccess()).some((x) => x.id === String(msg.chat.id));
+    if (!allowed) return;
+    c.role = isOwner ? 'owner' : 'premium';
+  } else {
+    c.role = await roleOf(from.id);
+    if (!c.role) {
+      if (cb) {
+        await tg('answerCallbackQuery', { callback_query_id: cb.id });
+      } else {
+        await tg('sendMessage', {
+          chat_id: c.chat,
+          text: `No tienes permiso para usar este bot.\nTu ID de Telegram es ${from.id}. Pídele al dueño que te dé acceso con /premium ${from.id}.`,
+        });
+      }
+      return;
     }
-    return;
-  }
-
-  const c = { chat: msg.chat.id, origin, msgId: cb ? msg.message_id : 0 };
-  c.role = await roleOf(from.id);
-
-  if (!c.role) {
-    if (cb) {
-      await tg('answerCallbackQuery', { callback_query_id: cb.id });
-    } else {
-      await tg('sendMessage', {
-        chat_id: c.chat,
-        text: `No tienes permiso para usar este bot.\nTu ID de Telegram es ${from.id}. Pídele al dueño que te dé acceso con /premium ${from.id}.`,
-      });
-    }
-    return;
   }
 
   try {
