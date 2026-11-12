@@ -560,6 +560,9 @@ ${noteHtml(note, bad)}
   ${serieFields()}
   <button class="btn" type="submit">Crear serie</button>
 </form>
+<h2>Bot de Telegram</h2>
+<p class="meta">Conéctalo una vez, después de configurar TELEGRAM_BOT_TOKEN en Netlify.</p>
+<form method="post" action="/admin/telegram/conectar"><button class="btn ghost" type="submit">Conectar bot de Telegram</button></form>
 <h2>Series (${list.length})</h2>
 <ul class="rows">${rows || '<li><span>No hay series todavía.</span></li>'}</ul>
 <form method="post" action="/admin/salir" class="out"><button class="btn ghost" type="submit">Cerrar sesión</button></form>`
@@ -824,6 +827,555 @@ const CLIENT_JS = `
 })();
 `;
 
+/* ---------- bot de Telegram ---------- */
+
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_ADMINS = (process.env.TELEGRAM_ADMIN_IDS || '')
+  .split(',')
+  .map((x) => x.trim())
+  .filter(Boolean);
+const tgSecret = () => crypto.createHmac('sha256', SECRET || 'sin-clave').update('telegram').digest('hex').slice(0, 48);
+
+async function tg(method, payload) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return await r.json();
+  } catch {
+    return { ok: false, description: 'sin conexión con Telegram' };
+  }
+}
+
+const stKey = (chat) => `tg-${chat}`;
+async function getState(chat) {
+  try {
+    return await getStore('videoteca').get(stKey(chat), { type: 'json' });
+  } catch {
+    return null;
+  }
+}
+const setState = (chat, st) => getStore('videoteca').setJSON(stKey(chat), st);
+async function clearState(chat) {
+  try {
+    await getStore('videoteca').delete(stKey(chat));
+  } catch {
+    /* sin estado */
+  }
+}
+
+const B = (text, data) => ({ text, callback_data: data });
+const trunc = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
+
+async function show(c, text, rows) {
+  const payload = { chat_id: c.chat, text, parse_mode: 'HTML', disable_web_page_preview: true };
+  if (rows) payload.reply_markup = { inline_keyboard: rows };
+  if (c.msgId) {
+    const r = await tg('editMessageText', { ...payload, message_id: c.msgId });
+    if (r.ok || /not modified/i.test(r.description || '')) return;
+  }
+  await tg('sendMessage', payload);
+}
+
+async function mutate(sid, fn) {
+  const list = await load();
+  const s = list.find((x) => x.id === sid);
+  if (!s) return null;
+  await fn(s, list);
+  await save(list);
+  return s;
+}
+
+/* ---------- pantallas ---------- */
+
+async function showMain(c, note = '') {
+  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción:`, [
+    [B('➕ Nueva serie', 'ns')],
+    [B('📚 Mis series', 'ls:0')],
+    [{ text: '🌐 Ver el sitio', url: c.origin }],
+  ]);
+}
+
+async function showSeriesList(c, page) {
+  const list = (await load()).sort(byNew);
+  if (!list.length) return show(c, 'Aún no hay series.', [[B('➕ Nueva serie', 'ns')], [B('⬅️ Menú', 'm')]]);
+  const per = 8;
+  const pages = Math.ceil(list.length / per);
+  const pg = Math.min(Math.max(page, 0), pages - 1);
+  const rows = list.slice(pg * per, pg * per + per).map((s) => [B(trunc(s.title, 48), `s:${s.id}`)]);
+  const nav = [];
+  if (pg > 0) nav.push(B('◀️', `ls:${pg - 1}`));
+  if (pg < pages - 1) nav.push(B('▶️', `ls:${pg + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([B('⬅️ Menú', 'm')]);
+  return show(c, `<b>Series</b> (${list.length}) · página ${pg + 1} de ${pages}`, rows);
+}
+
+async function showSeries(c, sid, note = '') {
+  const s = (await load()).find((x) => x.id === sid);
+  if (!s) return showMain(c, 'Esa serie ya no existe.');
+  const text = `${note ? note + '\n\n' : ''}<b>${esc(s.title)}</b>
+${esc(meta(s))}
+Géneros: ${esc((s.genres || []).join(', ') || '—')}
+Episodios: ${(s.episodes || []).length}
+En el carrusel: ${s.featured ? 'sí' : 'no'}`;
+  return show(c, text, [
+    [B('➕ Agregar episodio', `ae:${sid}`), B('🎞 Episodios', `le:${sid}`)],
+    [B('✏️ Editar datos', `ed:${sid}`)],
+    [{ text: '🌐 Ver en el sitio', url: `${c.origin}/media/${s.slug}` }],
+    [B('🗑 Eliminar serie', `ds:${sid}`)],
+    [B('⬅️ Series', 'ls:0')],
+  ]);
+}
+
+async function showEditMenu(c, sid) {
+  const s = (await load()).find((x) => x.id === sid);
+  if (!s) return showMain(c, 'Esa serie ya no existe.');
+  return show(c, `<b>Editar ${esc(s.title)}</b>\n¿Qué quieres cambiar?`, [
+    [B('Título', `es:${sid}:t`), B('Tipo', `es:${sid}:ty`)],
+    [B('Estado', `es:${sid}:st`), B('Año', `es:${sid}:y`)],
+    [B('Géneros', `es:${sid}:g`), B('Sinopsis', `es:${sid}:sy`)],
+    [B('Portada', `es:${sid}:c`), B('Imagen ancha', `es:${sid}:b`)],
+    [B(s.featured ? 'Quitar del carrusel' : 'Poner en el carrusel', `tf:${sid}`)],
+    [B('⬅️ Volver', `s:${sid}`)],
+  ]);
+}
+
+async function showEpisodes(c, sid) {
+  const s = (await load()).find((x) => x.id === sid);
+  if (!s) return showMain(c, 'Esa serie ya no existe.');
+  const eps = [...s.episodes].sort((a, b) => a.n - b.n);
+  const rows = [];
+  for (let i = 0; i < eps.length; i += 4) rows.push(eps.slice(i, i + 4).map((e) => B(`Ep ${e.n}`, `e:${sid}:${e.n}`)));
+  rows.push([B('➕ Agregar episodio', `ae:${sid}`)], [B('⬅️ Volver', `s:${sid}`)]);
+  return show(c, `<b>${esc(s.title)}</b>\n${eps.length ? 'Elige un episodio:' : 'Todavía no hay episodios.'}`, rows);
+}
+
+async function showEpisode(c, sid, n, note = '') {
+  const s = (await load()).find((x) => x.id === sid);
+  const e = s && s.episodes.find((x) => x.n === n);
+  if (!e) return showEpisodes(c, sid);
+  const srv = e.servers.map((v, i) => `${i + 1}. ${esc(v.name)}`).join('\n');
+  const text = `${note ? note + '\n\n' : ''}<b>${esc(s.title)} · Episodio ${e.n}</b>
+Título: ${esc(e.title || '—')}
+Imagen: ${e.thumb ? 'sí' : 'no'}
+Servidores:
+${srv}`;
+  return show(c, text, [
+    [B('🔢 Número', `ee:${sid}:${n}:n`), B('✏️ Título', `ee:${sid}:${n}:t`)],
+    [B('🖼 Imagen', `ee:${sid}:${n}:i`)],
+    [B('♻️ Reemplazar servidores', `ee:${sid}:${n}:u`)],
+    [B('➕ Agregar servidores', `ee:${sid}:${n}:a`), B('➖ Quitar uno', `rs:${sid}:${n}`)],
+    [{ text: '▶️ Ver episodio', url: `${c.origin}/media/${s.slug}/${n}` }],
+    [B('🗑 Eliminar episodio', `de:${sid}:${n}`)],
+    [B('⬅️ Episodios', `le:${sid}`)],
+  ]);
+}
+
+/* ---------- asistentes paso a paso ---------- */
+
+const SERIE_KINDS = { title: 'text', type: 'choice', status: 'choice', year: 'year', genres: 'genres', synopsis: 'text', cover: 'image', backdrop: 'image', featured: 'yesno' };
+const SERIE_ASK = {
+  title: 'Escribe el <b>título</b> de la serie.',
+  type: '¿Qué <b>tipo</b> es?',
+  status: '¿En qué <b>estado</b> está?',
+  year: 'Escribe el <b>año</b> (4 cifras).',
+  genres: 'Escribe los <b>géneros</b> separados por coma.\nEjemplo: Comedia, Acción',
+  synopsis: 'Escribe la <b>sinopsis</b>.',
+  cover: 'Envía la <b>portada</b>: una foto o un enlace de imagen.',
+  backdrop: 'Envía la <b>imagen ancha</b> del carrusel: una foto o un enlace.',
+  featured: '¿Mostrarla en el carrusel de la portada?',
+};
+const NEW_ORDER = Object.keys(SERIE_KINDS);
+const EP_KINDS = { n: 'epnum', title: 'text', urls: 'servers', thumb: 'image', add: 'servers' };
+const EP_ASK = {
+  n: 'Escribe el <b>número</b> del episodio.',
+  title: 'Escribe el <b>título</b> del episodio.',
+  urls: 'Envía los <b>enlaces de video</b>, uno por línea.\nPara ponerle nombre al servidor: Nombre | enlace',
+  thumb: 'Envía la <b>imagen del episodio</b>: una foto o un enlace.',
+  add: 'Envía los <b>enlaces</b> que quieres agregar, uno por línea.\nPara ponerle nombre: Nombre | enlace',
+};
+const EP_ORDER = ['n', 'title', 'urls', 'thumb'];
+const SERIE_CODES = { t: 'title', ty: 'type', st: 'status', y: 'year', g: 'genres', sy: 'synopsis', c: 'cover', b: 'backdrop' };
+const EP_CODES = { n: 'n', t: 'title', i: 'thumb', u: 'urls', a: 'add' };
+
+const optsOf = (k) => (k === 'type' ? TYPES : k === 'status' ? STATUSES : null);
+
+function stepOf(st) {
+  if (st.flow === 'new') {
+    const k = NEW_ORDER[st.i];
+    return k ? { k, kind: SERIE_KINDS[k], ask: SERIE_ASK[k], skip: k !== 'title', opts: optsOf(k) } : null;
+  }
+  if (st.flow === 'edit') {
+    const k = st.k;
+    return { k, kind: SERIE_KINDS[k], ask: SERIE_ASK[k], skip: false, clear: ['year', 'genres', 'synopsis', 'cover', 'backdrop'].includes(k), opts: optsOf(k) };
+  }
+  if (st.flow === 'addep') {
+    const k = EP_ORDER[st.i];
+    return k ? { k, kind: EP_KINDS[k], ask: EP_ASK[k], skip: k !== 'urls', skipLabel: k === 'n' ? 'Siguiente número' : 'Omitir' } : null;
+  }
+  if (st.flow === 'editep') {
+    const k = st.k;
+    const ask = k === 'urls' ? 'Envía los <b>enlaces nuevos</b>, uno por línea. Reemplazan a los actuales.\nPara ponerle nombre: Nombre | enlace' : EP_ASK[k];
+    return { k, kind: EP_KINDS[k], ask, skip: false, clear: k === 'title' || k === 'thumb' };
+  }
+  return null;
+}
+
+async function promptStep(c, st, note = '') {
+  const step = stepOf(st);
+  if (!step) return showMain(c);
+  let rows = [];
+  if (step.kind === 'choice') rows = step.opts.map((o, i) => [B(o, `w:c:${i}`)]);
+  else if (step.kind === 'yesno') rows = [[B('Sí', 'w:y:1'), B('No', 'w:y:0')]];
+  else if (step.skip) rows = [[B(step.skipLabel || 'Omitir', 'w:sk')]];
+  rows.push([B('✖ Cancelar', 'w:cx')]);
+  const hint = step.clear ? '\nEnvía - para dejarlo vacío.' : '';
+  await show(c, `${note ? note + '\n\n' : ''}${step.ask}${hint}`, rows);
+}
+
+async function imageFrom(msg) {
+  let fileId = '';
+  if (Array.isArray(msg.photo) && msg.photo.length) fileId = msg.photo[msg.photo.length - 1].file_id;
+  else if (msg.document && String(msg.document.mime_type || '').startsWith('image/')) fileId = msg.document.file_id;
+  if (fileId) {
+    const info = await tg('getFile', { file_id: fileId });
+    if (!info.ok) throw new Error('No pude leer la imagen de Telegram.');
+    const path = String(info.result.file_path || '');
+    const res = await fetch(`https://api.telegram.org/file/bot${TG_TOKEN}/${path}`);
+    if (!res.ok) throw new Error('No pude descargar la imagen de Telegram.');
+    const type = /\.png$/i.test(path) ? 'image/png' : /\.webp$/i.test(path) ? 'image/webp' : 'image/jpeg';
+    return uploadImage(new Blob([await res.arrayBuffer()], { type }));
+  }
+  return cleanUrl(String(msg.text || '').trim());
+}
+
+async function parseValue(step, msg) {
+  const text = String(msg.text || '').trim();
+  if (step.kind === 'image') {
+    if (step.clear && text === '-') return { value: '' };
+    const img = await imageFrom(msg);
+    return img ? { value: img } : { error: 'Envía una foto o un enlace de imagen.' };
+  }
+  if (!text) return { error: 'Envíalo como texto.' };
+  if (step.clear && text === '-') return { value: step.kind === 'genres' ? [] : '' };
+  if (step.kind === 'text') return { value: text.slice(0, 1500) };
+  if (step.kind === 'year') return /^\d{4}$/.test(text) ? { value: text } : { error: 'Escribe un año de 4 cifras.' };
+  if (step.kind === 'genres') {
+    const g = parseGenres(text);
+    return g.length ? { value: g } : { error: 'Escribe al menos un género.' };
+  }
+  if (step.kind === 'epnum') {
+    const n = parseInt(text, 10);
+    return /^\d{1,4}$/.test(text) && n >= 1 ? { value: n } : { error: 'Escribe un número válido, por ejemplo 5.' };
+  }
+  if (step.kind === 'servers') {
+    const r = parseServers(text);
+    if (r.error) return { error: r.error };
+    return r.servers.length ? { value: r } : { error: 'Envía al menos un enlace.' };
+  }
+  return { error: 'No entendí eso.' };
+}
+
+async function startNew(c) {
+  await setState(c.chat, { flow: 'new', i: 0, d: {} });
+  await promptStep(c, { flow: 'new', i: 0, d: {} });
+}
+
+async function startEdit(c, sid, code) {
+  const k = SERIE_CODES[code];
+  if (!k) return showEditMenu(c, sid);
+  const st = { flow: 'edit', sid, k };
+  await setState(c.chat, st);
+  await promptStep(c, st);
+}
+
+async function startAddEp(c, sid) {
+  const st = { flow: 'addep', sid, i: 0, d: {} };
+  await setState(c.chat, st);
+  await promptStep(c, st);
+}
+
+async function startEditEp(c, sid, n, code) {
+  const k = EP_CODES[code];
+  if (!k) return showEpisode(c, sid, n);
+  const st = { flow: 'editep', sid, n, k };
+  await setState(c.chat, st);
+  await promptStep(c, st);
+}
+
+async function finishNew(c, st) {
+  const d = st.d;
+  const list = await load();
+  const s = {
+    id: crypto.randomUUID().slice(0, 8),
+    slug: uniqueSlug(list, d.title),
+    episodes: [],
+    createdAt: new Date().toISOString(),
+    title: String(d.title).slice(0, 140),
+    type: d.type || TYPES[0],
+    status: d.status || STATUSES[0],
+    year: d.year || '',
+    genres: d.genres || [],
+    synopsis: d.synopsis || '',
+    cover: d.cover || '',
+    backdrop: d.backdrop || '',
+    featured: Boolean(d.featured),
+  };
+  list.unshift(s);
+  await save(list);
+  await clearState(c.chat);
+  await showSeries(c, s.id, '✅ Serie creada. Ahora puedes agregar sus episodios.');
+}
+
+async function finishAddEp(c, st) {
+  const d = st.d;
+  let finalN = 0;
+  const s = await mutate(st.sid, (s) => {
+    let n = d.n;
+    if (!(n >= 1 && n <= 9999)) n = Math.max(0, ...s.episodes.map((e) => e.n)) + 1;
+    finalN = n;
+    const thumb = d.thumb || d.thumbAuto || '';
+    const ex = s.episodes.find((e) => e.n === n);
+    if (ex) {
+      ex.servers = [...ex.servers, ...d.servers].slice(0, 12);
+      if (!ex.thumb && thumb) ex.thumb = thumb;
+      if (d.title) ex.title = d.title;
+    } else {
+      s.episodes.push({ n, title: d.title || '', thumb, servers: d.servers, createdAt: new Date().toISOString() });
+      s.episodes.sort((a, b) => a.n - b.n);
+    }
+  });
+  await clearState(c.chat);
+  if (!s) return showMain(c, 'Esa serie ya no existe.');
+  await showEpisode(c, st.sid, finalN, '✅ Episodio guardado.');
+}
+
+// value === undefined significa "omitir este paso"
+async function applyValue(c, st, step, value) {
+  if (st.flow === 'new') {
+    if (value !== undefined) st.d[step.k] = value;
+    st.i += 1;
+    if (NEW_ORDER[st.i]) {
+      await setState(c.chat, st);
+      return promptStep(c, st);
+    }
+    return finishNew(c, st);
+  }
+
+  if (st.flow === 'edit') {
+    await mutate(st.sid, (s) => {
+      s[st.k] = st.k === 'title' ? String(value).slice(0, 140) : value;
+    });
+    await clearState(c.chat);
+    return showSeries(c, st.sid, '✅ Guardado.');
+  }
+
+  if (st.flow === 'addep') {
+    if (value !== undefined) {
+      if (step.k === 'urls') {
+        st.d.servers = value.servers;
+        if (value.thumb) st.d.thumbAuto = value.thumb;
+      } else if (step.k === 'title') st.d.title = String(value).slice(0, 120);
+      else st.d[step.k] = value;
+    }
+    st.i += 1;
+    if (EP_ORDER[st.i]) {
+      await setState(c.chat, st);
+      return promptStep(c, st);
+    }
+    return finishAddEp(c, st);
+  }
+
+  if (st.flow === 'editep') {
+    let err = '';
+    let nn = st.n;
+    await mutate(st.sid, (s) => {
+      const e = s.episodes.find((x) => x.n === st.n);
+      if (!e) return;
+      if (st.k === 'n') {
+        if (value !== e.n && s.episodes.some((x) => x.n === value)) {
+          err = 'Ya existe otro episodio con ese número.';
+          return;
+        }
+        e.n = value;
+        nn = value;
+        s.episodes.sort((a, b) => a.n - b.n);
+      } else if (st.k === 'title') e.title = String(value).slice(0, 120);
+      else if (st.k === 'thumb') e.thumb = value;
+      else if (st.k === 'urls') {
+        e.servers = value.servers;
+        if (!e.thumb && value.thumb) e.thumb = value.thumb;
+      } else if (st.k === 'add') e.servers = [...e.servers, ...value.servers].slice(0, 12);
+    });
+    if (err) return promptStep(c, st, err);
+    await clearState(c.chat);
+    return showEpisode(c, st.sid, nn, '✅ Guardado.');
+  }
+}
+
+async function onInput(c, st, msg) {
+  const step = stepOf(st);
+  if (!step) {
+    await clearState(c.chat);
+    return showMain(c);
+  }
+  if (step.kind === 'choice' || step.kind === 'yesno') return promptStep(c, st, 'Usa los botones para elegir.');
+  const r = await parseValue(step, msg);
+  if (r.error) return promptStep(c, st, r.error);
+  return applyValue(c, st, step, r.value);
+}
+
+async function onWizard(c, parts) {
+  const st = await getState(c.chat);
+  if (!st) return showMain(c);
+  const [a, b] = parts;
+  if (a === 'cx') {
+    await clearState(c.chat);
+    if (st.sid && st.n) return showEpisode(c, st.sid, st.n);
+    if (st.sid) return showSeries(c, st.sid);
+    return showMain(c);
+  }
+  const step = stepOf(st);
+  if (!step) return showMain(c);
+  if (a === 'sk') return step.skip ? applyValue(c, st, step, undefined) : promptStep(c, st);
+  if (a === 'c' && step.opts && step.opts[Number(b)] !== undefined) return applyValue(c, st, step, step.opts[Number(b)]);
+  if (a === 'y' && step.kind === 'yesno') return applyValue(c, st, step, b === '1');
+  return promptStep(c, st);
+}
+
+/* ---------- botones y mensajes ---------- */
+
+async function onCallback(c, data) {
+  const [op, x, y, z] = data.split(':');
+
+  if (op === 'w') return onWizard(c, [x, y]);
+
+  if (op === 'm') {
+    await clearState(c.chat);
+    return showMain(c);
+  }
+  if (op === 'ls') return showSeriesList(c, Number(x) || 0);
+  if (op === 'ns') return startNew(c);
+  if (op === 's') {
+    await clearState(c.chat);
+    return showSeries(c, x);
+  }
+  if (op === 'ed') return showEditMenu(c, x);
+  if (op === 'es') return startEdit(c, x, y);
+  if (op === 'tf') {
+    const s = await mutate(x, (s) => {
+      s.featured = !s.featured;
+    });
+    return s ? showEditMenu(c, x) : showMain(c, 'Esa serie ya no existe.');
+  }
+  if (op === 'ds') {
+    const s = (await load()).find((v) => v.id === x);
+    if (!s) return showMain(c, 'Esa serie ya no existe.');
+    return show(c, `¿Eliminar <b>${esc(s.title)}</b> con todos sus episodios?`, [[B('Sí, eliminar', `dsy:${x}`)], [B('Cancelar', `s:${x}`)]]);
+  }
+  if (op === 'dsy') {
+    await save((await load()).filter((v) => v.id !== x));
+    return showSeriesList(c, 0);
+  }
+  if (op === 'ae') return startAddEp(c, x);
+  if (op === 'le') return showEpisodes(c, x);
+  if (op === 'e') return showEpisode(c, x, Number(y));
+  if (op === 'ee') return startEditEp(c, x, Number(y), z);
+  if (op === 'rs') {
+    const s = (await load()).find((v) => v.id === x);
+    const e = s && s.episodes.find((v) => v.n === Number(y));
+    if (!e) return showEpisodes(c, x);
+    const rows = e.servers.map((v, i) => [B(`✕ ${trunc(v.name, 40)}`, `rsx:${x}:${y}:${i}`)]);
+    rows.push([B('⬅️ Volver', `e:${x}:${y}`)]);
+    return show(c, '¿Qué servidor quieres quitar?', rows);
+  }
+  if (op === 'rsx') {
+    let gone = false;
+    await mutate(x, (s) => {
+      const e = s.episodes.find((v) => v.n === Number(y));
+      if (!e) return;
+      e.servers = e.servers.filter((_, i) => i !== Number(z));
+      if (!e.servers.length) {
+        s.episodes = s.episodes.filter((v) => v !== e);
+        gone = true;
+      }
+    });
+    return gone ? showEpisodes(c, x) : showEpisode(c, x, Number(y), '✅ Servidor quitado.');
+  }
+  if (op === 'de') {
+    return show(c, `¿Eliminar el episodio ${esc(y)}?`, [[B('Sí, eliminar', `dey:${x}:${y}`)], [B('Cancelar', `e:${x}:${y}`)]]);
+  }
+  if (op === 'dey') {
+    await mutate(x, (s) => {
+      s.episodes = s.episodes.filter((v) => v.n !== Number(y));
+    });
+    return showEpisodes(c, x);
+  }
+  return showMain(c);
+}
+
+async function onMessage(c, msg) {
+  const text = String(msg.text || '').trim();
+  if (/^\/(start|menu|cancelar|cancel)\b/i.test(text)) {
+    await clearState(c.chat);
+    return showMain(c);
+  }
+  const st = await getState(c.chat);
+  if (!st) return showMain(c, 'Usa los botones para administrar el sitio.');
+  return onInput(c, st, msg);
+}
+
+async function onUpdate(u, origin) {
+  const cb = u.callback_query;
+  const msg = cb ? cb.message : u.message;
+  if (!msg || !msg.chat || msg.chat.type !== 'private') return;
+  const from = (cb ? cb.from : msg.from) || {};
+  const c = { chat: msg.chat.id, origin, msgId: cb ? msg.message_id : 0 };
+
+  if (!TG_ADMINS.includes(String(from.id))) {
+    if (cb) {
+      await tg('answerCallbackQuery', { callback_query_id: cb.id });
+    } else {
+      await tg('sendMessage', {
+        chat_id: c.chat,
+        text: `No tienes permiso para usar este bot.\nTu ID de Telegram es ${from.id}. Para darte acceso, agrégalo en la variable TELEGRAM_ADMIN_IDS en Netlify.`,
+      });
+    }
+    return;
+  }
+
+  try {
+    if (cb) {
+      await tg('answerCallbackQuery', { callback_query_id: cb.id });
+      await onCallback(c, String(cb.data || ''));
+    } else {
+      await onMessage(c, msg);
+    }
+  } catch (err) {
+    await tg('sendMessage', { chat_id: c.chat, text: `Ocurrió un error: ${(err && err.message) || 'intenta de nuevo'}` });
+  }
+}
+
+async function handleTelegram(req) {
+  if (!TG_TOKEN) return new Response('apagado', { status: 404 });
+  if (req.headers.get('x-telegram-bot-api-secret-token') !== tgSecret()) return new Response('no', { status: 403 });
+  let u;
+  try {
+    u = await req.json();
+  } catch {
+    return new Response('ok');
+  }
+  try {
+    await onUpdate(u, new URL(req.url).origin);
+  } catch (err) {
+    console.error('telegram', err && err.message);
+  }
+  return new Response('ok');
+}
+
 /* ---------- respuestas ---------- */
 
 const SECURITY = {
@@ -867,6 +1419,8 @@ export default async (req, context) => {
     if (p === '/app.js') return send(CLIENT_JS, 'application/javascript; charset=utf-8', 200, { 'Cache-Control': 'public, max-age=300' });
     if (p === '/salud') return send('ok', 'text/plain');
   }
+
+  if (req.method === 'POST' && p === '/telegram/hook') return handleTelegram(req);
 
   let form = null;
   let fd = null;
@@ -1021,6 +1575,22 @@ export default async (req, context) => {
       }
       await save(list);
       return go(req, `/admin/serie/${s.id}?m=epok`);
+    }
+
+    if (p === '/admin/telegram/conectar') {
+      if (!TG_TOKEN) return page(adminPage(req, list, 'Falta la variable TELEGRAM_BOT_TOKEN en Netlify.', true));
+      const r = await tg('setWebhook', {
+        url: `${url.origin}/telegram/hook`,
+        secret_token: tgSecret(),
+        allowed_updates: ['message', 'callback_query'],
+        drop_pending_updates: true,
+      });
+      if (!r.ok) return page(adminPage(req, list, `Telegram no aceptó la conexión: ${r.description || 'error'}`, true));
+      await tg('setMyCommands', { commands: [{ command: 'menu', description: 'Abrir el menú' }] });
+      const aviso = TG_ADMINS.length
+        ? 'Bot conectado. Abre tu bot en Telegram y escribe /start.'
+        : 'Bot conectado. Escríbele /start en Telegram: te dirá tu ID para agregarlo en TELEGRAM_ADMIN_IDS.';
+      return page(adminPage(req, list, aviso, false));
     }
 
     const saveEp = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/guardar$/);
