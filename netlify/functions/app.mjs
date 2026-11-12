@@ -830,10 +830,13 @@ const CLIENT_JS = `
 /* ---------- bot de Telegram ---------- */
 
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const TG_ADMINS = (process.env.TELEGRAM_ADMIN_IDS || '')
-  .split(',')
-  .map((x) => x.trim())
-  .filter(Boolean);
+const TG_OWNERS = [
+  ...new Set(
+    ['8608744395', ...(process.env.TELEGRAM_OWNER_IDS || '').split(','), ...(process.env.TELEGRAM_ADMIN_IDS || '').split(',')]
+      .map((x) => x.trim())
+      .filter(Boolean)
+  ),
+];
 const tgSecret = () => crypto.createHmac('sha256', SECRET || 'sin-clave').update('telegram').digest('hex').slice(0, 48);
 
 async function tg(method, payload) {
@@ -867,6 +870,58 @@ async function clearState(chat) {
 }
 
 const B = (text, data) => ({ text, callback_data: data });
+async function getAccess() {
+  try {
+    const d = await getStore('videoteca').get('tg-access', { type: 'json' });
+    return Array.isArray(d) ? d : [];
+  } catch {
+    return [];
+  }
+}
+const setAccess = (list) => getStore('videoteca').setJSON('tg-access', list);
+
+async function roleOf(userId) {
+  const id = String(userId);
+  if (TG_OWNERS.includes(id)) return 'owner';
+  const list = await getAccess();
+  if (list.some((x) => x.id === id)) return 'premium';
+  for (const g of list.filter((x) => x.id.startsWith('-')).slice(0, 10)) {
+    const r = await tg('getChatMember', { chat_id: Number(g.id), user_id: Number(id) });
+    if (r.ok && r.result && ['creator', 'administrator', 'member'].includes(r.result.status)) return 'premium';
+  }
+  return null;
+}
+
+async function ownerCommand(c, text) {
+  const m = text.match(/^\/(premium|quitarpremium|premiums)(?:@\w+)?(?:\s+(\S+))?/i);
+  const cmd = m[1].toLowerCase();
+  const raw = (m[2] || '').replace(/^\+/, '');
+  const list = await getAccess();
+  const fmt = (x) => `• ${esc(x.id)}${x.label ? ' · ' + esc(x.label) : ''} (${x.id.startsWith('-') ? 'grupo' : 'usuario'})`;
+  if (cmd === 'premiums' || !raw) {
+    return show(
+      c,
+      `<b>Acceso premium</b>\n${list.length ? list.map(fmt).join('\n') : 'Nadie por ahora.'}\n\n/premium ID: dar acceso a un usuario o grupo\n/quitarpremium ID: quitar el acceso\n/premiums: ver la lista`
+    );
+  }
+  if (!/^-?\d{5,20}$/.test(raw)) return show(c, 'Escribe un ID numérico. Ejemplo: /premium 123456789');
+  if (cmd === 'quitarpremium') {
+    if (!list.some((x) => x.id === raw)) return show(c, 'Ese ID no está en la lista premium.');
+    await setAccess(list.filter((x) => x.id !== raw));
+    return show(c, `✅ Acceso quitado a ${esc(raw)}.`);
+  }
+  if (TG_OWNERS.includes(raw)) return show(c, 'Ese ID ya es dueño.');
+  if (list.some((x) => x.id === raw)) return show(c, 'Ese ID ya tiene acceso.');
+  const info = await tg('getChat', { chat_id: Number(raw) });
+  const r = info.ok && info.result ? info.result : {};
+  const label = String(r.title || [r.first_name, r.last_name].filter(Boolean).join(' ') || (r.username ? '@' + r.username : '')).slice(0, 40);
+  const item = { id: raw, label, addedAt: new Date().toISOString() };
+  list.push(item);
+  await setAccess(list);
+  if (!raw.startsWith('-')) await tg('sendMessage', { chat_id: Number(raw), text: 'Ya tienes acceso al bot. Escribe /start para empezar.' });
+  return show(c, `✅ Acceso dado a ${fmt(item)}.`);
+}
+
 const trunc = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + '…' : String(s));
 
 async function show(c, text, rows) {
@@ -891,7 +946,8 @@ async function mutate(sid, fn) {
 /* ---------- pantallas ---------- */
 
 async function showMain(c, note = '') {
-  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción:`, [
+  const owner = c.role === 'owner' ? '\n\nDueño: /premium ID · /quitarpremium ID · /premiums' : '';
+  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción:${owner}`, [
     [B('➕ Nueva serie', 'ns')],
     [B('📚 Mis series', 'ls:0')],
     [{ text: '🌐 Ver el sitio', url: c.origin }],
@@ -1319,6 +1375,10 @@ async function onCallback(c, data) {
 
 async function onMessage(c, msg) {
   const text = String(msg.text || '').trim();
+  if (/^\/(premium|quitarpremium|premiums)\b/i.test(text)) {
+    if (c.role === 'owner') return ownerCommand(c, text);
+    return show(c, 'Ese comando es solo para el dueño.');
+  }
   if (/^\/(start|menu|cancelar|cancel)\b/i.test(text)) {
     await clearState(c.chat);
     return showMain(c);
@@ -1331,17 +1391,27 @@ async function onMessage(c, msg) {
 async function onUpdate(u, origin) {
   const cb = u.callback_query;
   const msg = cb ? cb.message : u.message;
-  if (!msg || !msg.chat || msg.chat.type !== 'private') return;
+  if (!msg || !msg.chat) return;
   const from = (cb ? cb.from : msg.from) || {};
-  const c = { chat: msg.chat.id, origin, msgId: cb ? msg.message_id : 0 };
 
-  if (!TG_ADMINS.includes(String(from.id))) {
+  if (msg.chat.type !== 'private') {
+    const t = String(msg.text || '').trim();
+    if (!cb && TG_OWNERS.includes(String(from.id)) && /^\/premium(@\w+)?$/i.test(t)) {
+      return ownerCommand({ chat: msg.chat.id, origin, msgId: 0, role: 'owner' }, `/premium ${msg.chat.id}`);
+    }
+    return;
+  }
+
+  const c = { chat: msg.chat.id, origin, msgId: cb ? msg.message_id : 0 };
+  c.role = await roleOf(from.id);
+
+  if (!c.role) {
     if (cb) {
       await tg('answerCallbackQuery', { callback_query_id: cb.id });
     } else {
       await tg('sendMessage', {
         chat_id: c.chat,
-        text: `No tienes permiso para usar este bot.\nTu ID de Telegram es ${from.id}. Para darte acceso, agrégalo en la variable TELEGRAM_ADMIN_IDS en Netlify.`,
+        text: `No tienes permiso para usar este bot.\nTu ID de Telegram es ${from.id}. Pídele al dueño que te dé acceso con /premium ${from.id}.`,
       });
     }
     return;
@@ -1587,10 +1657,7 @@ export default async (req, context) => {
       });
       if (!r.ok) return page(adminPage(req, list, `Telegram no aceptó la conexión: ${r.description || 'error'}`, true));
       await tg('setMyCommands', { commands: [{ command: 'menu', description: 'Abrir el menú' }] });
-      const aviso = TG_ADMINS.length
-        ? 'Bot conectado. Abre tu bot en Telegram y escribe /start.'
-        : 'Bot conectado. Escríbele /start en Telegram: te dirá tu ID para agregarlo en TELEGRAM_ADMIN_IDS.';
-      return page(adminPage(req, list, aviso, false));
+      return page(adminPage(req, list, 'Bot conectado. Abre tu bot en Telegram y escribe /start.', false));
     }
 
     const saveEp = p.match(/^\/admin\/serie\/([\w-]+)\/episodio\/(\d+)\/guardar$/);
