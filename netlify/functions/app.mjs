@@ -1047,9 +1047,9 @@ const EP_KINDS = { n: 'epnum', title: 'text', urls: 'servers', thumb: 'image', a
 const EP_ASK = {
   n: 'Escribe el <b>número</b> del episodio.',
   title: 'Escribe el <b>título</b> del episodio.',
-  urls: 'Envía los <b>enlaces de video</b>, uno por línea.\nPara ponerle nombre al servidor: Nombre | enlace',
+  urls: 'Envía los <b>enlaces de video</b>. Si son varios, uno por línea; el servidor se detecta solo.',
   thumb: 'Envía la <b>imagen del episodio</b>: una foto o un enlace.',
-  add: 'Envía los <b>enlaces</b> que quieres agregar, uno por línea.\nPara ponerle nombre: Nombre | enlace',
+  add: 'Envía los <b>enlaces</b> que quieres agregar. Si son varios, uno por línea.',
 };
 const EP_ORDER = ['n', 'title', 'urls', 'thumb'];
 const SERIE_CODES = { t: 'title', ty: 'type', st: 'status', y: 'year', g: 'genres', sy: 'synopsis', c: 'cover', b: 'backdrop' };
@@ -1072,7 +1072,7 @@ function stepOf(st) {
   }
   if (st.flow === 'editep') {
     const k = st.k;
-    const ask = k === 'urls' ? 'Envía los <b>enlaces nuevos</b>, uno por línea. Reemplazan a los actuales.\nPara ponerle nombre: Nombre | enlace' : EP_ASK[k];
+    const ask = k === 'urls' ? 'Envía los <b>enlaces nuevos</b>, uno por línea. Reemplazan a los actuales.' : EP_ASK[k];
     return { k, kind: EP_KINDS[k], ask, skip: false, clear: k === 'title' || k === 'thumb' };
   }
   return null;
