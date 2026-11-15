@@ -256,7 +256,15 @@ function parseSource(raw) {
     return { error: 'No se pudo leer el enlace de Pixeldrain.' };
   }
 
-  if (VIDEO_EXT.test(u.pathname)) return { kind: 'video', provider: host.endsWith('catbox.moe') ? 'Catbox' : 'Enlace directo', embed: u.href };
+  if (/^(streamtape|strtape|streamta)\./.test(host)) {
+    const m = u.pathname.match(/^\/(?:e|v)\/([\w-]+)(\/.*)?$/);
+    if (m) return { kind: 'frame', provider: 'Streamtape', embed: `${u.origin}/e/${m[1]}${m[2] || ''}` };
+  }
+
+  // un enlace /e/ o /embed/ es una página de reproductor aunque termine en .mp4
+  if (VIDEO_EXT.test(u.pathname) && !/\/(e|embed|v)\//.test(u.pathname)) {
+    return { kind: 'video', provider: host.endsWith('catbox.moe') ? 'Catbox' : 'Enlace directo', embed: u.href };
+  }
 
   if (/^voe[\w.-]*$/.test(host)) {
     const m = u.pathname.match(/^\/(?:e\/)?([\w-]+)$/);
@@ -1003,7 +1011,7 @@ async function mutate(sid, fn) {
 
 async function showMain(c, note = '') {
   const owner = c.role === 'owner' && !c.group ? '\n\nDueño: /premium ID · /quitarpremium ID · /premiums' : '';
-  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción.\nPara crear una serie rápido, pega su ficha (Título, Géneros, Estado, Sinopsis…).${owner}`, [
+  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción.\nPara crear una serie rápido, pega su ficha (Título, Géneros, Estado, Sinopsis…).\nCapítulo rápido: /ep -e 4 -s voe -id CODIGO -ft none${owner}`, [
     [B('➕ Nueva serie', 'ns')],
     [B('📚 Mis series', 'ls:0')],
     [{ text: '🌐 Ver el sitio', url: c.origin }],
@@ -1286,6 +1294,7 @@ async function finishNew(c, st) {
   await save(list);
   await clearState(c.key);
   await showSeries(c, s.id, '✅ Serie creada. Ahora puedes agregar sus episodios.');
+  await setLast(c, s.id);
 }
 
 async function finishAddEp(c, st) {
@@ -1500,6 +1509,148 @@ async function fichaStart(c, f, msg) {
   await tg('deleteMessage', { chat_id: c.chat, message_id: msg.message_id });
 }
 
+/* ---------- /ep: agregar un capítulo con un comando ---------- */
+
+const EP_HOSTS = {
+  voe: (id) => `https://voe.sx/${id}`,
+  tape: (id) => `https://streamtape.com/e/${id}`,
+  file: (id) => `https://filemoon.org/${id}/watch`,
+  mega: (id) => `https://mega.nz/file/${id}`,
+  dood: (id) => `${process.env.DOOD_EMBED_BASE || 'https://playmogo.com/e/'}${id}`,
+  lulu: (id) => `${process.env.LULU_EMBED_BASE || 'https://lulustream.com/e/'}${id}`,
+  pix: (id) => `https://pixeldrain.com/u/${id}`,
+};
+const EP_ALIAS = { streamtape: 'tape', filemoon: 'file', playmogo: 'dood', doodstream: 'dood', lulustream: 'lulu', luluvip: 'lulu', pixeldrain: 'pix' };
+const EP_FLAGS = ['-e', '-s', '-id', '-ft', '-sr', '-t'];
+
+const EP_AYUDA = `<b>Agregar capítulo rápido</b>
+<code>/ep -e 4 -s voe -id CODIGO -ft none</code>
+
+-e número del capítulo
+-s servidor: voe, tape, file, mega, dood, lulu, pix
+-id código del enlace (en tape va todo lo que sigue a /e/)
+-ft foto del capítulo: none (sin foto) o true (te la pido)
+
+Varios servidores en el mismo comando:
+<code>/ep -e 4 -s voe -id AAA -s tape -id BBB/video.mp4</code>
+
+La serie es la última que abriste o creaste. Para otra: <code>-sr Nombre de la serie</code>
+También puedes poner un enlace completo en -id.`;
+
+function parseEpArgs(raw) {
+  const toks = [...String(raw).matchAll(/"([^"]*)"|(\S+)/g)].map((m) => (m[1] !== undefined ? m[1] : m[2].replace(/^[\u2010-\u2015\u2212]+/, '-')));
+  const out = { servers: [] };
+  let i = 0;
+  const take = () => {
+    const v = [];
+    while (i < toks.length && !EP_FLAGS.includes(String(toks[i]).toLowerCase())) v.push(toks[i++]);
+    return v.join(' ').trim();
+  };
+  while (i < toks.length) {
+    const f = String(toks[i++]).toLowerCase();
+    if (!EP_FLAGS.includes(f)) return { error: `No entendí «${f}».` };
+    const v = take();
+    if (f === '-e') {
+      if (!/^\d{1,4}$/.test(v) || parseInt(v, 10) < 1) return { error: 'El número del capítulo (-e) debe ser un número, por ejemplo 4.' };
+      out.n = parseInt(v, 10);
+    } else if (f === '-s') {
+      if (!v) return { error: 'Falta el servidor después de -s.' };
+      out.servers.push({ key: v.toLowerCase(), id: '' });
+    } else if (f === '-id') {
+      const last = out.servers[out.servers.length - 1];
+      if (!last || last.id) return { error: 'Cada -id va después de su -s. Ejemplo: -s voe -id CODIGO' };
+      if (!v) return { error: 'Falta el código después de -id.' };
+      last.id = v;
+    } else if (f === '-ft') {
+      const x = v.toLowerCase();
+      if (['none', 'no', 'n', 'false', '0'].includes(x)) out.ft = 'none';
+      else if (['true', 'si', 'sí', 'sip', 'yes', 'y', '1'].includes(x)) out.ft = 'true';
+      else return { error: 'En -ft usa none (sin foto) o true (con foto).' };
+    } else if (f === '-sr') {
+      out.sr = v;
+    } else if (f === '-t') {
+      out.title = v.slice(0, 120);
+    }
+  }
+  if (!out.servers.length) return { error: 'Falta el servidor y el código: -s voe -id CODIGO' };
+  if (out.servers.some((x) => !x.id)) return { error: 'Cada -s necesita su -id.' };
+  return out;
+}
+
+function buscarSerie(list, q) {
+  const norm = slugify(q);
+  const s = list.find((x) => x.id === q) || list.find((x) => x.slug === norm) || list.find((x) => slugify(x.title) === norm);
+  if (s) return { s };
+  const cand = list.filter((x) => x.slug.includes(norm) || slugify(x.title).includes(norm));
+  if (cand.length === 1) return { s: cand[0] };
+  return { error: cand.length ? `Varias series coinciden: ${cand.slice(0, 5).map((x) => x.title).join(', ')}` : `No encontré la serie «${q}».` };
+}
+
+const lastKey = (c) => `tg-last-${c.key}`;
+async function getLast(c) {
+  try {
+    return await store().get(lastKey(c), { type: 'json' });
+  } catch {
+    return null;
+  }
+}
+const setLast = (c, sid) => store().setJSON(lastKey(c), { sid, panel: c.msgId || 0 });
+
+async function epCommand(c, msg, text) {
+  const raw = text.replace(/^\/ep(@\w+)?/i, '').trim();
+  const last = await getLast(c);
+  if (last && last.panel && !c.msgId) c.msgId = last.panel;
+  if (!raw) return show(c, EP_AYUDA);
+
+  const a = parseEpArgs(raw);
+  if (a.error) return show(c, `⚠️ ${esc(a.error)}\n\n${EP_AYUDA}`);
+
+  const list = await load();
+  let s;
+  if (a.sr) {
+    const r = buscarSerie(list, a.sr);
+    if (r.error) return show(c, `⚠️ ${esc(r.error)}`);
+    s = r.s;
+  } else {
+    s = last && list.find((x) => x.id === last.sid);
+    if (!s) return show(c, '⚠️ Primero abre o crea una serie (Mis series), o agrega <code>-sr Nombre de la serie</code> al comando.');
+  }
+
+  const servers = [];
+  for (const it of a.servers) {
+    const key = EP_ALIAS[it.key] || it.key;
+    const url = /^https?:\/\//i.test(it.id) ? it.id : EP_HOSTS[key] ? EP_HOSTS[key](it.id.replace(/^\/+/, '')) : null;
+    if (!url) return show(c, `⚠️ No conozco el servidor «${esc(it.key)}». Usa: ${Object.keys(EP_HOSTS).join(', ')}.`);
+    const src = parseSource(url);
+    if (src.error) return show(c, `⚠️ ${esc(src.error)} (${esc(trunc(url, 60))})`);
+    servers.push({ name: src.provider, kind: src.kind, provider: src.provider, embed: src.embed });
+  }
+
+  // la foto puede venir pegada al comando (el comando va como pie de la foto)
+  const traeImagen = (Array.isArray(msg.photo) && msg.photo.length) || (msg.document && String(msg.document.mime_type || '').startsWith('image/'));
+  let thumb = '';
+  if (traeImagen && a.ft !== 'none') {
+    await show(c, '⏳ Subiendo la imagen…');
+    try {
+      thumb = await imageFrom(msg);
+    } catch (e) {
+      return show(c, `⚠️ No pude guardar la imagen: ${esc(e.message)}`);
+    }
+  }
+
+  const d = { n: a.n, title: a.title || '', servers, thumb };
+  if (a.ft === 'true' && !thumb) {
+    // el capítulo se guarda cuando mandes la foto (o toques Omitir)
+    const st = { flow: 'addep', sid: s.id, i: 3, d, panel: c.msgId, stitle: s.title };
+    await setState(c.key, st);
+    await promptStep(c, st);
+  } else {
+    await finishAddEp(c, { sid: s.id, d });
+  }
+  await setLast(c, s.id);
+  await tg('deleteMessage', { chat_id: c.chat, message_id: msg.message_id });
+}
+
 async function onInput(c, st, msg) {
   // todo ocurre en un solo mensaje: se edita el panel y se borra lo que escribiste
   if (st.panel) c.msgId = st.panel;
@@ -1540,6 +1691,7 @@ async function onWizard(c, parts) {
 
 async function onCallback(c, data) {
   const [op, x, y, z] = data.split(':');
+  if (['s', 'le', 'e', 'ee', 'ae', 'ed', 'es'].includes(op) && x) await setLast(c, x);
 
   if (op === 'w') return onWizard(c, [x, y]);
 
@@ -1618,6 +1770,7 @@ async function onMessage(c, msg) {
     await clearState(c.key);
     return showMain(c);
   }
+  if (/^\/ep(@\w+)?(\s|$)/i.test(text)) return epCommand(c, msg, text);
   const ficha = parseFicha(text);
   if (isFicha(ficha)) {
     const actual = await getState(c.key);
