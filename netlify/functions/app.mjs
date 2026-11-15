@@ -441,7 +441,7 @@ function catalogPage(all, qs) {
 
   let list = all.filter(
     (s) =>
-      (!q || s.title.toLowerCase().includes(q.toLowerCase())) &&
+      (!q || s.title.toLowerCase().includes(q.toLowerCase()) || String(s.original || '').toLowerCase().includes(q.toLowerCase())) &&
       (!genre || (s.genres || []).includes(genre)) &&
       (!type || s.type === type) &&
       (!status || s.status === status) &&
@@ -503,7 +503,8 @@ function seriePage(s) {
   <div class="scover">${s.cover ? imgTag(s.cover) : initial(s)}</div>
   <div class="sinfo">
     <h1>${esc(s.title)}</h1>
-    <p class="sub">${esc(meta(s))}</p>
+    ${s.original ? `<p class="meta">${esc(s.original)}</p>` : ''}
+    <p class="sub">${esc(meta(s))}${s.studio ? ' · ' + esc(s.studio) : ''}</p>
     <div class="chips">${tags(s)}</div>
     ${s.synopsis ? `<p class="syn2">${esc(s.synopsis)}</p>` : ''}
     ${eps.length ? `<a class="btn" href="/media/${esc(s.slug)}/${eps[0].n}">Ver episodio ${eps[0].n}</a>` : ''}
@@ -1002,7 +1003,7 @@ async function mutate(sid, fn) {
 
 async function showMain(c, note = '') {
   const owner = c.role === 'owner' && !c.group ? '\n\nDueño: /premium ID · /quitarpremium ID · /premiums' : '';
-  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción:${owner}`, [
+  await show(c, `${note ? note + '\n\n' : ''}<b>${esc(SITE_NAME)}</b>\nElige una opción.\nPara crear una serie rápido, pega su ficha (Título, Géneros, Estado, Sinopsis…).${owner}`, [
     [B('➕ Nueva serie', 'ns')],
     [B('📚 Mis series', 'ls:0')],
     [{ text: '🌐 Ver el sitio', url: c.origin }],
@@ -1149,7 +1150,7 @@ function mostrar(k, v) {
 // lo que ya llevas registrado, para verlo en el mismo mensaje
 function resumenDe(st) {
   if (st.flow === 'new') {
-    const lines = NEW_ORDER.slice(0, st.i).map((k) => `${LABELS[k]}: ${esc(mostrar(k, st.d[k]))}`);
+    const lines = NEW_ORDER.filter((k, idx) => idx < st.i || (st.pre || []).includes(k)).map((k) => `${LABELS[k]}: ${esc(mostrar(k, st.d[k]))}`);
     return `🆕 <b>Nueva serie</b>${lines.length ? '\n' + lines.join('\n') : ''}`;
   }
   if (st.flow === 'addep') {
@@ -1269,6 +1270,8 @@ async function finishNew(c, st) {
     episodes: [],
     createdAt: new Date().toISOString(),
     title: String(d.title).slice(0, 140),
+    original: d.original || '',
+    studio: d.studio || '',
     type: d.type || TYPES[0],
     lang: d.lang || '',
     status: d.status || STATUSES[0],
@@ -1313,6 +1316,7 @@ async function applyValue(c, st, step, value) {
   if (st.flow === 'new') {
     if (value !== undefined) st.d[step.k] = value;
     st.i += 1;
+    while (NEW_ORDER[st.i] && (st.pre || []).includes(NEW_ORDER[st.i])) st.i += 1;
     if (NEW_ORDER[st.i]) {
       await setState(c.key, st);
       return promptStep(c, st);
@@ -1369,6 +1373,114 @@ async function applyValue(c, st, step, value) {
     await clearState(c.key);
     return showEpisode(c, st.sid, nn, '✅ Guardado.');
   }
+}
+
+/* ---------- ficha pegada en el chat ---------- */
+
+const plainText = (s) =>
+  String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+const FICHA_LABELS = {
+  titulo: 'title',
+  original: 'original',
+  genero: 'genres',
+  generos: 'genres',
+  capitulo: 'chapters',
+  capitulos: 'chapters',
+  episodio: 'chapters',
+  episodios: 'chapters',
+  adaptacion: 'adaptation',
+  fecha: 'date',
+  'fecha de lanzamiento': 'date',
+  lanzamiento: 'date',
+  estreno: 'date',
+  estado: 'status',
+  estudio: 'studio',
+};
+
+const cleanTag = (t) => String(t).replace(/^#+/, '').replace(/_+/g, ' ').trim();
+
+// Lee textos tipo ficha: "Título: …", "Géneros: #A #B", "Estado: …", "Sinopsis" y su texto
+function parseFicha(raw) {
+  const text = String(raw || '')
+    .replace(/[\u{1F000}-\u{1FAFF}\u2600-\u27BF\uFE0E\uFE0F\u200B-\u200F]/gu, ' ')
+    .normalize('NFKC')
+    .replace(/\uFF1A/g, ':');
+  const found = {};
+  const syn = [];
+  let inSyn = false;
+
+  for (const line0 of text.split(/\r?\n/)) {
+    const line = line0.trim();
+    if (!line) {
+      if (inSyn && syn.length && syn[syn.length - 1] !== '') syn.push('');
+      continue;
+    }
+    const colon = line.indexOf(':');
+    const label = colon > 0 ? plainText(line.slice(0, colon)).replace(/[^a-z ]+/g, ' ').replace(/\s+/g, ' ').trim() : '';
+    const value = colon > 0 ? line.slice(colon + 1).trim() : '';
+
+    if (label === 'sinopsis') {
+      inSyn = true;
+      if (value) syn.push(value);
+      continue;
+    }
+    if (FICHA_LABELS[label]) {
+      inSyn = false;
+      if (!(FICHA_LABELS[label] in found)) found[FICHA_LABELS[label]] = value;
+      continue;
+    }
+    // encabezado decorado, por ejemplo ╞═══ Sinopsis ═══╡ (solo símbolos y la palabra)
+    if (!inSyn && /sinopsis/.test(plainText(line)) && !/[a-z0-9]/.test(plainText(line).replace('sinopsis', ''))) {
+      inSyn = true;
+      continue;
+    }
+    if (inSyn) syn.push(line);
+  }
+
+  const out = {};
+  if (found.title) out.title = found.title.slice(0, 140);
+  if (found.original) out.original = found.original.slice(0, 200);
+  if (found.genres) {
+    const parts = found.genres.includes('#') ? found.genres.split(/\s+/) : found.genres.split(/[,;]+/);
+    const g = parseGenres(parts.map(cleanTag).filter(Boolean).join(','));
+    if (g.length) out.genres = g;
+  }
+  if (found.date) {
+    const m = found.date.match(/(?:19|20)\d{2}/);
+    if (m) out.year = m[0];
+  }
+  if (found.status) {
+    const st = plainText(found.status);
+    if (st.includes('emis')) out.status = STATUSES[1];
+    else if (st.includes('final') || st.includes('complet') || st.includes('conclu')) out.status = STATUSES[0];
+  }
+  if (found.studio) out.studio = cleanTag(found.studio).slice(0, 80);
+  if (found.chapters) out.chapters = found.chapters;
+  const sinopsis = syn.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (sinopsis) out.synopsis = sinopsis.slice(0, 1500);
+  out.type = /\bova\b/i.test(`${found.title || ''} ${found.original || ''} ${found.adaptation || ''}`) ? 'OVA' : TYPES[0];
+  return out;
+}
+
+// parece una ficha si trae el título y al menos otro dato
+const isFicha = (f) => Boolean(f.title && (f.genres || f.synopsis || f.status || f.year || f.studio));
+
+async function fichaStart(c, f, msg) {
+  const d = { title: f.title, type: f.type, status: f.status, year: f.year, genres: f.genres, synopsis: f.synopsis, original: f.original, studio: f.studio };
+  const has = (k) => d[k] !== undefined && d[k] !== '' && !(Array.isArray(d[k]) && !d[k].length);
+  const pre = NEW_ORDER.filter(has);
+  Object.keys(d).forEach((k) => {
+    if (!has(k)) delete d[k];
+  });
+  const st = { flow: 'new', i: 0, d, pre, panel: c.msgId };
+  while (NEW_ORDER[st.i] && pre.includes(NEW_ORDER[st.i])) st.i += 1;
+  await setState(c.key, st);
+  await promptStep(c, st);
+  await tg('deleteMessage', { chat_id: c.chat, message_id: msg.message_id });
 }
 
 async function onInput(c, st, msg) {
@@ -1488,6 +1600,12 @@ async function onMessage(c, msg) {
   if (/^\/(start|menu|cancelar|cancel)\b/i.test(text)) {
     await clearState(c.key);
     return showMain(c);
+  }
+  const ficha = parseFicha(text);
+  if (isFicha(ficha)) {
+    const actual = await getState(c.key);
+    if (actual && actual.panel) c.msgId = actual.panel;
+    return fichaStart(c, ficha, msg);
   }
   const st = await getState(c.key);
   if (!st) return c.group ? undefined : showMain(c, 'Usa los botones para administrar el sitio.');
