@@ -7,9 +7,17 @@ const store = () => getStore({ name: 'videoteca', consistency: 'strong' });
 const SITE_NAME = process.env.SITE_NAME || 'Videoteca';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SECRET = process.env.SESSION_SECRET || ADMIN_PASSWORD;
-const IMGBB_KEY = process.env.IMGBB_KEY || '';
+// limpia espacios, comillas, "key=" o una dirección completa pegada por error
+const IMGBB_KEY = (() => {
+  let k = String(process.env.IMGBB_KEY || '').trim().replace(/^["']+|["']+$/g, '');
+  const m = k.match(/key=([A-Za-z0-9]+)/);
+  if (m) k = m[1];
+  return k.trim();
+})();
+const API_TOKEN = process.env.API_TOKEN || '';
 const PER_PAGE = 24;
-const TYPES = ['OVA', 'Serie', 'Película', 'Especial'];
+const TYPES = ['Hentai', 'OVA'];
+const LANGS = ['Español', 'Japonés'];
 const STATUSES = ['Finalizado', 'En emisión'];
 
 async function uploadImage(file) {
@@ -41,7 +49,10 @@ async function uploadImage(file) {
   }
   if (!res.ok || !j || !j.success || !j.data || !j.data.url) {
     const why = j && j.error && j.error.message ? j.error.message : raw.replace(/\s+/g, ' ').slice(0, 80);
-    throw new Error(`ImgBB no aceptó la imagen (código ${res.status})${why ? ': ' + why : ''}`);
+    const clave = /invalid api/i.test(String(why))
+      ? ` La clave configurada en IMGBB_KEY tiene ${IMGBB_KEY.length} caracteres y debe tener 32. Cópiala de nuevo desde api.imgbb.com.`
+      : '';
+    throw new Error(`ImgBB no aceptó la imagen (código ${res.status})${why ? ': ' + String(why).replace(/\.+$/, '') : ''}.${clave}`);
   }
   return j.data.url;
 }
@@ -64,6 +75,8 @@ async function load() {
     if (!Array.isArray(d)) return [];
     d.forEach((s) => {
       s.episodes = (s.episodes || []).map(normalizeEp);
+      if (!TYPES.includes(s.type)) s.type = TYPES[0];
+      if (!LANGS.includes(s.lang)) s.lang = '';
     });
     return d;
   } catch {
@@ -237,7 +250,13 @@ function parseSource(raw) {
     return { kind: 'video', provider: 'Dropbox', embed: d.href };
   }
 
-  if (VIDEO_EXT.test(u.pathname)) return { kind: 'video', provider: 'Enlace directo', embed: u.href };
+  if (host === 'pixeldrain.com' || host === 'pixeldrain.net') {
+    const m = u.pathname.match(/^\/(?:u|e|api\/file)\/([\w-]+)/);
+    if (m) return { kind: 'frame', provider: 'Pixeldrain', embed: `https://pixeldrain.com/e/${m[1]}` };
+    return { error: 'No se pudo leer el enlace de Pixeldrain.' };
+  }
+
+  if (VIDEO_EXT.test(u.pathname)) return { kind: 'video', provider: host.endsWith('catbox.moe') ? 'Catbox' : 'Enlace directo', embed: u.href };
 
   if (/^voe[\w.-]*$/.test(host)) {
     const m = u.pathname.match(/^\/(?:e\/)?([\w-]+)$/);
@@ -290,7 +309,7 @@ const imgTag = (src, cls = '') =>
   src ? `<img ${cls ? `class="${cls}" ` : ''}src="${esc(src)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : '';
 
 const initial = (s) => `<span class="ph">${esc((s.title[0] || '?').toUpperCase())}</span>`;
-const meta = (s) => [s.type, s.year, s.status].filter(Boolean).join(' · ');
+const meta = (s) => [s.type, s.lang, s.year, s.status].filter(Boolean).join(' · ');
 const tags = (s, n = 15) =>
   (s.genres || [])
     .slice(0, n)
@@ -346,7 +365,7 @@ function gatePage(next) {
 
 function poster(s) {
   return `<a class="poster" href="/media/${esc(s.slug)}">
-  <div class="pimg">${s.cover ? imgTag(s.cover) : initial(s)}<em class="badge">${esc(s.type)}</em></div>
+  <div class="pimg">${s.cover ? imgTag(s.cover) : initial(s)}<em class="badge">${esc(s.type)}</em>${s.lang ? `<em class="badge r">${esc(s.lang)}</em>` : ''}</div>
   <h3>${esc(s.title)}</h3>
 </a>`;
 }
@@ -380,6 +399,13 @@ function hero(list) {
   return `<section class="hero"><div class="slides" id="slides">${slides}</div>${list.length > 1 ? '<div class="dots" id="dots"></div>' : ''}</section>`;
 }
 
+function langNav() {
+  const href = (k, v) => `/catalogo?${k}=${encodeURIComponent(v)}`;
+  return `<nav class="langs"><span>Ver:</span>${LANGS.map((l) => `<a class="tag" href="${esc(href('lang', l))}">${esc(l)}</a>`).join('')}${STATUSES.map(
+    (t) => `<a class="tag" href="${esc(href('status', t))}">${esc(t === 'Finalizado' ? 'Finalizadas' : t)}</a>`
+  ).join('')}</nav>`;
+}
+
 function homePage(list) {
   if (!list.length) {
     return layout({
@@ -397,7 +423,8 @@ function homePage(list) {
   return layout({
     title: SITE_NAME,
     script: true,
-    body: `${hero(slides)}
+    body: `${langNav()}
+${hero(slides)}
 ${eps.length ? `<section class="sec"><div class="sh"><h2>Episodios recientes</h2></div><div class="eps">${eps.map(epCard).join('')}</div></section>` : ''}
 <section class="sec"><div class="sh"><h2>Recientemente agregados</h2><a href="/catalogo">Ver catálogo</a></div><div class="posters">${added.map(poster).join('')}</div></section>`,
   });
@@ -408,6 +435,7 @@ function catalogPage(all, qs) {
   const genre = qs.get('genre') || '';
   const type = qs.get('type') || '';
   const status = qs.get('status') || '';
+  const lang = LANGS.includes(qs.get('lang')) ? qs.get('lang') : '';
   const order = qs.get('order') === 'az' ? 'az' : 'recent';
   const pageNum = Math.max(1, parseInt(qs.get('page'), 10) || 1);
 
@@ -416,7 +444,8 @@ function catalogPage(all, qs) {
       (!q || s.title.toLowerCase().includes(q.toLowerCase())) &&
       (!genre || (s.genres || []).includes(genre)) &&
       (!type || s.type === type) &&
-      (!status || s.status === status)
+      (!status || s.status === status) &&
+      (!lang || s.lang === lang)
   );
   list = order === 'az' ? list.sort((a, b) => a.title.localeCompare(b.title, 'es')) : list.sort(byNew);
 
@@ -426,6 +455,13 @@ function catalogPage(all, qs) {
   const genres = [...new Set(all.flatMap((s) => s.genres || []))].sort((a, b) => a.localeCompare(b, 'es'));
 
   const opt = (val, label, cur) => `<option value="${esc(val)}"${val === cur ? ' selected' : ''}>${esc(label)}</option>`;
+  const langChip = (v, label) => {
+    const u = new URLSearchParams(qs);
+    if (v) u.set('lang', v);
+    else u.delete('lang');
+    u.delete('page');
+    return `<a class="tag${lang === v ? ' on' : ''}" href="/catalogo?${esc(u.toString())}">${esc(label)}</a>`;
+  };
   const link = (n, label) => {
     const u = new URLSearchParams(qs);
     u.set('page', String(n));
@@ -436,7 +472,9 @@ function catalogPage(all, qs) {
     title: `Catálogo | ${SITE_NAME}`,
     q,
     body: `<div class="head"><h1>Catálogo</h1><span class="count">${list.length} ${list.length === 1 ? 'resultado' : 'resultados'}</span></div>
+<nav class="langs"><span>Idioma:</span>${langChip('', 'Todos')}${LANGS.map((l) => langChip(l, l)).join('')}</nav>
 <form class="filters" method="get" action="/catalogo">
+  <input type="hidden" name="lang" value="${esc(lang)}">
   <input type="search" name="q" value="${esc(q)}" placeholder="Buscar por título" aria-label="Buscar por título">
   <select name="genre" aria-label="Género"><option value="">Todos los géneros</option>${genres.map((g) => opt(g, g, genre)).join('')}</select>
   <select name="type" aria-label="Tipo"><option value="">Todos los tipos</option>${TYPES.map((t) => opt(t, t, type)).join('')}</select>
@@ -537,6 +575,7 @@ function serieFields(s = {}) {
 <label>Título<input name="title" maxlength="140" required value="${v('title')}"></label>
 <div class="two">
   <label>Tipo<select name="type">${TYPES.map((t) => `<option${s.type === t ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
+  <label>Idioma<select name="lang"><option value="">Sin definir</option>${LANGS.map((t) => `<option${s.lang === t ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
   <label>Estado<select name="status">${STATUSES.map((t) => `<option${s.status === t ? ' selected' : ''}>${t}</option>`).join('')}</select></label>
   <label>Año<input name="year" inputmode="numeric" maxlength="4" value="${v('year')}"></label>
 </div>
@@ -684,6 +723,9 @@ input::placeholder,textarea::placeholder{color:#7d74a0}
 .empty{color:var(--muted);padding:32px 0}
 .empty a{color:var(--accent)}
 .badge{position:absolute;top:8px;left:8px;background:var(--accent);color:#2a1d05;font-style:normal;font-weight:600;font-size:.72rem;padding:2px 9px;border-radius:999px}
+.badge.r{left:auto;right:8px;background:var(--surface);color:var(--text);border:1px solid var(--line)}
+.langs{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0 0 16px;color:var(--muted)}
+.tag.on{background:var(--accent);border-color:var(--accent);color:#2a1d05;font-weight:600}
 .ph{display:grid;place-items:center;height:100%;font:800 3rem 'Bricolage Grotesque',sans-serif;color:var(--line)}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
 .tag{border:1px solid var(--line);border-radius:999px;padding:2px 12px;font-size:.85rem;color:var(--muted);text-decoration:none;background:rgba(27,21,48,.6)}
@@ -943,7 +985,8 @@ async function show(c, text, rows) {
     const r = await tg('editMessageText', { ...payload, message_id: c.msgId });
     if (r.ok || /not modified/i.test(r.description || '')) return;
   }
-  await tg('sendMessage', payload);
+  const r = await tg('sendMessage', payload);
+  if (r.ok && r.result && r.result.message_id) c.msgId = r.result.message_id;
 }
 
 async function mutate(sid, fn) {
@@ -1003,9 +1046,10 @@ async function showEditMenu(c, sid) {
   if (!s) return showMain(c, 'Esa serie ya no existe.');
   return show(c, `<b>Editar ${esc(s.title)}</b>\n¿Qué quieres cambiar?`, [
     [B('Título', `es:${sid}:t`), B('Tipo', `es:${sid}:ty`)],
-    [B('Estado', `es:${sid}:st`), B('Año', `es:${sid}:y`)],
-    [B('Géneros', `es:${sid}:g`), B('Sinopsis', `es:${sid}:sy`)],
-    [B('Portada', `es:${sid}:c`), B('Imagen ancha', `es:${sid}:b`)],
+    [B('Idioma', `es:${sid}:l`), B('Estado', `es:${sid}:st`)],
+    [B('Año', `es:${sid}:y`), B('Géneros', `es:${sid}:g`)],
+    [B('Sinopsis', `es:${sid}:sy`), B('Portada', `es:${sid}:c`)],
+    [B('Imagen ancha', `es:${sid}:b`)],
     [B(s.featured ? 'Quitar del carrusel' : 'Poner en el carrusel', `tf:${sid}`)],
     [B('⬅️ Volver', `s:${sid}`)],
   ]);
@@ -1044,10 +1088,11 @@ ${srv}`;
 
 /* ---------- asistentes paso a paso ---------- */
 
-const SERIE_KINDS = { title: 'text', type: 'choice', status: 'choice', year: 'year', genres: 'genres', synopsis: 'text', cover: 'image', backdrop: 'image', featured: 'yesno' };
+const SERIE_KINDS = { title: 'text', type: 'choice', lang: 'choice', status: 'choice', year: 'year', genres: 'genres', synopsis: 'text', cover: 'image', backdrop: 'image', featured: 'yesno' };
 const SERIE_ASK = {
   title: 'Escribe el <b>título</b> de la serie.',
   type: '¿Qué <b>tipo</b> es?',
+  lang: '¿En qué <b>idioma</b> están los videos?',
   status: '¿En qué <b>estado</b> está?',
   year: 'Escribe el <b>año</b> (4 cifras).',
   genres: 'Escribe los <b>géneros</b> separados por coma.\nEjemplo: Comedia, Acción',
@@ -1066,10 +1111,10 @@ const EP_ASK = {
   add: 'Envía los <b>enlaces</b> que quieres agregar. Si son varios, uno por línea.',
 };
 const EP_ORDER = ['n', 'title', 'urls', 'thumb'];
-const SERIE_CODES = { t: 'title', ty: 'type', st: 'status', y: 'year', g: 'genres', sy: 'synopsis', c: 'cover', b: 'backdrop' };
+const SERIE_CODES = { t: 'title', ty: 'type', l: 'lang', st: 'status', y: 'year', g: 'genres', sy: 'synopsis', c: 'cover', b: 'backdrop' };
 const EP_CODES = { n: 'n', t: 'title', i: 'thumb', u: 'urls', a: 'add' };
 
-const optsOf = (k) => (k === 'type' ? TYPES : k === 'status' ? STATUSES : null);
+const optsOf = (k) => (k === 'type' ? TYPES : k === 'lang' ? LANGS : k === 'status' ? STATUSES : null);
 
 function stepOf(st) {
   if (st.flow === 'new') {
@@ -1092,6 +1137,36 @@ function stepOf(st) {
   return null;
 }
 
+const LABELS = { title: 'Título', type: 'Tipo', lang: 'Idioma', status: 'Estado', year: 'Año', genres: 'Géneros', synopsis: 'Sinopsis', cover: 'Portada', backdrop: 'Imagen ancha', featured: 'Carrusel' };
+function mostrar(k, v) {
+  if (v === undefined || v === '' || (Array.isArray(v) && !v.length)) return '—';
+  if (k === 'cover' || k === 'backdrop') return '✔ recibida';
+  if (k === 'genres') return v.join(', ');
+  if (k === 'featured') return v ? 'sí' : 'no';
+  return trunc(v, 40);
+}
+
+// lo que ya llevas registrado, para verlo en el mismo mensaje
+function resumenDe(st) {
+  if (st.flow === 'new') {
+    const lines = NEW_ORDER.slice(0, st.i).map((k) => `${LABELS[k]}: ${esc(mostrar(k, st.d[k]))}`);
+    return `🆕 <b>Nueva serie</b>${lines.length ? '\n' + lines.join('\n') : ''}`;
+  }
+  if (st.flow === 'addep') {
+    const d = st.d;
+    const lines = EP_ORDER.slice(0, st.i).map((k) => {
+      if (k === 'n') return `Número: ${d.n || 'el siguiente'}`;
+      if (k === 'title') return `Título: ${esc(d.title || '—')}`;
+      if (k === 'urls') return `Enlaces: ${d.servers ? d.servers.length : 0}`;
+      return `Imagen: ${d.thumb ? '✔ recibida' : '—'}`;
+    });
+    return `🎞 <b>Nuevo episodio</b>${st.stitle ? ' · ' + esc(st.stitle) : ''}${lines.length ? '\n' + lines.join('\n') : ''}`;
+  }
+  if (st.flow === 'edit') return `✏️ <b>Editar serie</b>${st.stitle ? ' · ' + esc(st.stitle) : ''}`;
+  if (st.flow === 'editep') return `✏️ <b>Editar episodio ${st.n}</b>${st.stitle ? ' · ' + esc(st.stitle) : ''}`;
+  return '';
+}
+
 async function promptStep(c, st, note = '') {
   const step = stepOf(st);
   if (!step) return showMain(c);
@@ -1101,7 +1176,12 @@ async function promptStep(c, st, note = '') {
   else if (step.skip) rows = [[B(step.skipLabel || 'Omitir', 'w:sk')]];
   rows.push([B('✖ Cancelar', 'w:cx')]);
   const hint = step.clear ? '\nEnvía - para dejarlo vacío.' : '';
-  await show(c, `${note ? note + '\n\n' : ''}${step.ask}${hint}`, rows);
+  await show(c, `${resumenDe(st)}\n\n${note ? note + '\n\n' : ''}${step.ask}${hint}`, rows);
+  // si hubo que mandar un mensaje nuevo, ese pasa a ser el panel
+  if (c.msgId && st.panel !== c.msgId) {
+    st.panel = c.msgId;
+    await setState(c.key, st);
+  }
 }
 
 async function imageFrom(msg) {
@@ -1147,21 +1227,27 @@ async function parseValue(step, msg) {
   return { error: 'No entendí eso.' };
 }
 
+async function titleOf(sid) {
+  const s = (await load()).find((x) => x.id === sid);
+  return s ? s.title : '';
+}
+
 async function startNew(c) {
-  await setState(c.key, { flow: 'new', i: 0, d: {} });
-  await promptStep(c, { flow: 'new', i: 0, d: {} });
+  const st = { flow: 'new', i: 0, d: {}, panel: c.msgId };
+  await setState(c.key, st);
+  await promptStep(c, st);
 }
 
 async function startEdit(c, sid, code) {
   const k = SERIE_CODES[code];
   if (!k) return showEditMenu(c, sid);
-  const st = { flow: 'edit', sid, k };
+  const st = { flow: 'edit', sid, k, panel: c.msgId, stitle: await titleOf(sid) };
   await setState(c.key, st);
   await promptStep(c, st);
 }
 
 async function startAddEp(c, sid) {
-  const st = { flow: 'addep', sid, i: 0, d: {} };
+  const st = { flow: 'addep', sid, i: 0, d: {}, panel: c.msgId, stitle: await titleOf(sid) };
   await setState(c.key, st);
   await promptStep(c, st);
 }
@@ -1169,7 +1255,7 @@ async function startAddEp(c, sid) {
 async function startEditEp(c, sid, n, code) {
   const k = EP_CODES[code];
   if (!k) return showEpisode(c, sid, n);
-  const st = { flow: 'editep', sid, n, k };
+  const st = { flow: 'editep', sid, n, k, panel: c.msgId, stitle: await titleOf(sid) };
   await setState(c.key, st);
   await promptStep(c, st);
 }
@@ -1184,6 +1270,7 @@ async function finishNew(c, st) {
     createdAt: new Date().toISOString(),
     title: String(d.title).slice(0, 140),
     type: d.type || TYPES[0],
+    lang: d.lang || '',
     status: d.status || STATUSES[0],
     year: d.year || '',
     genres: d.genres || [],
@@ -1285,15 +1372,21 @@ async function applyValue(c, st, step, value) {
 }
 
 async function onInput(c, st, msg) {
-  const step = stepOf(st);
-  if (!step) {
-    await clearState(c.key);
-    return showMain(c);
+  // todo ocurre en un solo mensaje: se edita el panel y se borra lo que escribiste
+  if (st.panel) c.msgId = st.panel;
+  try {
+    const step = stepOf(st);
+    if (!step) {
+      await clearState(c.key);
+      return await showMain(c);
+    }
+    if (step.kind === 'choice' || step.kind === 'yesno') return await promptStep(c, st, 'Usa los botones para elegir.');
+    const r = await parseValue(step, msg);
+    if (r.error) return await promptStep(c, st, r.error);
+    return await applyValue(c, st, step, r.value);
+  } finally {
+    await tg('deleteMessage', { chat_id: c.chat, message_id: msg.message_id });
   }
-  if (step.kind === 'choice' || step.kind === 'yesno') return promptStep(c, st, 'Usa los botones para elegir.');
-  const r = await parseValue(step, msg);
-  if (r.error) return promptStep(c, st, r.error);
-  return applyValue(c, st, step, r.value);
 }
 
 async function onWizard(c, parts) {
@@ -1468,6 +1561,65 @@ async function handleTelegram(req) {
   return new Response('ok');
 }
 
+/* ---------- API para el programa de subida ---------- */
+
+const jsonRes = (obj, status = 200) =>
+  new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+
+async function handleApi(req, p) {
+  const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+  if (!API_TOKEN || !token || !safeEqual(token, API_TOKEN)) return jsonRes({ error: 'No autorizado' }, 401);
+  const list = await load();
+
+  if (p === '/api/series' && req.method === 'GET') {
+    return jsonRes(list.map((s) => ({ id: s.id, slug: s.slug, title: s.title, episodes: (s.episodes || []).length })));
+  }
+
+  if (p === '/api/episodio' && req.method === 'POST') {
+    let body;
+    try {
+      body = await req.json();
+    } catch {
+      return jsonRes({ error: 'JSON no válido' }, 400);
+    }
+    const q = String(body.serie || '').trim();
+    if (!q) return jsonRes({ error: 'Falta la serie' }, 400);
+    const norm = slugify(q);
+    let s = list.find((x) => x.id === q) || list.find((x) => x.slug === norm) || list.find((x) => slugify(x.title) === norm);
+    if (!s) {
+      const cand = list.filter((x) => x.slug.includes(norm) || slugify(x.title).includes(norm));
+      if (cand.length === 1) s = cand[0];
+      else {
+        return jsonRes({ error: cand.length ? `Varias series coinciden: ${cand.slice(0, 5).map((x) => x.title).join(', ')}` : `No encontré la serie "${q}"` }, 404);
+      }
+    }
+    const items = Array.isArray(body.servers) ? body.servers.slice(0, 12) : [];
+    const servers = [];
+    for (const it of items) {
+      const src = parseSource(String((it && it.url) || ''));
+      if (src.error) return jsonRes({ error: `${src.error} (${String((it && it.url) || '').slice(0, 60)})` }, 400);
+      servers.push({ name: String((it && it.name) || '').trim().slice(0, 30) || src.provider, kind: src.kind, provider: src.provider, embed: src.embed });
+    }
+    if (!servers.length) return jsonRes({ error: 'No hay servidores' }, 400);
+    let n = parseInt(body.n, 10);
+    if (!(n >= 1 && n <= 9999)) n = Math.max(0, ...s.episodes.map((e) => e.n)) + 1;
+    const title = String(body.titulo || '').trim().slice(0, 120);
+    const ex = s.episodes.find((e) => e.n === n);
+    if (ex) {
+      for (const v of servers) if (!ex.servers.some((x) => x.embed === v.embed)) ex.servers.push(v);
+      ex.servers = ex.servers.slice(0, 12);
+      if (title) ex.title = title;
+    } else {
+      s.episodes.push({ n, title, thumb: '', servers, createdAt: new Date().toISOString() });
+      s.episodes.sort((a, b) => a.n - b.n);
+    }
+    await save(list);
+    return jsonRes({ ok: true, serie: s.title, slug: s.slug, n, servidores: servers.length });
+  }
+
+  return jsonRes({ error: 'No encontrado' }, 404);
+}
+
 /* ---------- respuestas ---------- */
 
 const SECURITY = {
@@ -1513,6 +1665,7 @@ export default async (req, context) => {
   }
 
   if (req.method === 'POST' && p === '/telegram/hook') return handleTelegram(req);
+  if (p === '/api/series' || p === '/api/episodio') return handleApi(req, p);
 
   let form = null;
   let fd = null;
@@ -1602,6 +1755,7 @@ export default async (req, context) => {
       const data = {
         title,
         type: TYPES.includes(form.get('type')) ? form.get('type') : TYPES[0],
+        lang: LANGS.includes(form.get('lang')) ? form.get('lang') : '',
         status: STATUSES.includes(form.get('status')) ? form.get('status') : STATUSES[0],
         year: /^\d{4}$/.test(year) ? year : '',
         genres: parseGenres(form.get('genres')),
