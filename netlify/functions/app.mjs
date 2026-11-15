@@ -1399,6 +1399,8 @@ const FICHA_LABELS = {
   estreno: 'date',
   estado: 'status',
   estudio: 'studio',
+  idioma: 'lang',
+  audio: 'lang',
 };
 
 const cleanTag = (t) => String(t).replace(/^#+/, '').replace(/_+/g, ' ').trim();
@@ -1458,6 +1460,11 @@ function parseFicha(raw) {
     if (st.includes('emis')) out.status = STATUSES[1];
     else if (st.includes('final') || st.includes('complet') || st.includes('conclu')) out.status = STATUSES[0];
   }
+  if (found.lang) {
+    const lg = plainText(found.lang);
+    if (lg.includes('espa') || lg.includes('latin') || lg.includes('castell')) out.lang = LANGS[0];
+    else if (lg.includes('japon')) out.lang = LANGS[1];
+  }
   if (found.studio) out.studio = cleanTag(found.studio).slice(0, 80);
   if (found.chapters) out.chapters = found.chapters;
   const sinopsis = syn.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -1470,7 +1477,17 @@ function parseFicha(raw) {
 const isFicha = (f) => Boolean(f.title && (f.genres || f.synopsis || f.status || f.year || f.studio));
 
 async function fichaStart(c, f, msg) {
-  const d = { title: f.title, type: f.type, status: f.status, year: f.year, genres: f.genres, synopsis: f.synopsis, original: f.original, studio: f.studio };
+  const d = { title: f.title, type: f.type, lang: f.lang, status: f.status, year: f.year, genres: f.genres, synopsis: f.synopsis, original: f.original, studio: f.studio };
+  let nota = '';
+  const traeImagen = (Array.isArray(msg.photo) && msg.photo.length) || (msg.document && String(msg.document.mime_type || '').startsWith('image/'));
+  if (traeImagen) {
+    await show(c, '⏳ Leyendo la ficha y subiendo la portada…');
+    try {
+      d.cover = await imageFrom(msg);
+    } catch (e) {
+      nota = `⚠️ No pude guardar la portada: ${e.message}`;
+    }
+  }
   const has = (k) => d[k] !== undefined && d[k] !== '' && !(Array.isArray(d[k]) && !d[k].length);
   const pre = NEW_ORDER.filter(has);
   Object.keys(d).forEach((k) => {
@@ -1479,7 +1496,7 @@ async function fichaStart(c, f, msg) {
   const st = { flow: 'new', i: 0, d, pre, panel: c.msgId };
   while (NEW_ORDER[st.i] && pre.includes(NEW_ORDER[st.i])) st.i += 1;
   await setState(c.key, st);
-  await promptStep(c, st);
+  await promptStep(c, st, nota);
   await tg('deleteMessage', { chat_id: c.chat, message_id: msg.message_id });
 }
 
@@ -1591,7 +1608,7 @@ async function onCallback(c, data) {
 }
 
 async function onMessage(c, msg) {
-  const text = String(msg.text || '').trim();
+  const text = String(msg.text || msg.caption || '').trim();
   if (/^\/(premium|quitarpremium|premiums)\b/i.test(text)) {
     if (c.group) return;
     if (c.role === 'owner') return ownerCommand(c, text);
