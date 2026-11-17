@@ -1514,7 +1514,7 @@ async function fichaStart(c, f, msg) {
 const EP_HOSTS = {
   voe: (id) => `https://voe.sx/${id}`,
   tape: (id) => `https://streamtape.com/e/${id}`,
-  file: (id) => `https://filemoon.org/${id}/watch`,
+  file: (id) => `https://filemoon.org/${id}/embed`,
   mega: (id) => `https://mega.nz/file/${id}`,
   dood: (id) => `${process.env.DOOD_EMBED_BASE || 'https://playmogo.com/e/'}${id}`,
   lulu: (id) => `${process.env.LULU_EMBED_BASE || 'https://lulustream.com/e/'}${id}`,
